@@ -1,0 +1,2151 @@
+#INFO: **** input file is /home/evgeniy/prog/pyscf/pyscf/adc/test_lanczos/ip_adc_lanczos.py ****
+#!/usr/bin/env python3
+
+"""
+ip_adc_lanczos.py
+
+Validation of a symmetric Lanczos implementation for PySCF IP-ADC.
+
+PySCF's restricted IP-ADC matrix representation is not symmetric
+with respect to the ordinary Euclidean scalar product. Instead,
+
+    A^T S = S A
+
+with
+
+    S = diag(I_1h, 2 I - P_jk)
+
+where P_jk exchanges the two occupied indices of a 2h1p
+amplitude r[a,j,k].
+
+Since S is positive definite, define
+
+    A_sym = S^(1/2) A S^(-1/2).
+
+A_sym is symmetric and has exactly the same eigenvalues as A.
+
+This script:
+    1. Runs RHF and ADC(2)
+    2. Constructs the IP-ADC matvec
+    3. Implements S^(+/-1/2) matrix-free
+    4. Constructs a symmetric transformed matvec
+    5. Tests symmetry numerically
+    6. Runs standard symmetric Lanczos
+    7. Compares Lanczos Ritz values with PySCF Davidson
+    8. Computes Ritz residual norms
+    9. Checks Lanczos-basis orthogonality
+
+The explicit ADC matrix is NOT constructed during Lanczos.
+"""
+
+import numpy as np
+
+from pyscf import gto, scf, adc
+from pyscf.adc import radc_ip
+
+
+HARTREE2EV = 27.211386245988
+
+
+# ============================================================
+# Metric transformations
+# ============================================================
+
+def apply_sqrt_metric(x, nocc, nvir):
+    """
+    Apply S^(1/2) to an IP-ADC vector.
+
+    The IP vector is
+
+        x = (x_1h, x_2h1p)
+
+    and
+
+        S = diag(I, 2I - P_jk).
+
+    For the 2h1p sector,
+
+        S^(1/2) = a I + b P
+
+    with
+
+        a = (1 + sqrt(3))/2
+        b = (1 - sqrt(3))/2.
+    """
+
+    x = np.asarray(x)
+    y = np.array(x, copy=True)
+
+    ns = nocc
+
+    r2 = x[ns:].reshape(nvir, nocc, nocc)
+
+    sqrt3 = np.sqrt(3.0)
+
+    a = 0.5 * (1.0 + sqrt3)
+    b = 0.5 * (1.0 - sqrt3)
+
+    y[ns:] = (
+        a * r2
+        + b * r2.transpose(0, 2, 1)
+    ).reshape(-1)
+
+    return y
+
+
+def apply_invsqrt_metric(x, nocc, nvir):
+    """
+    Apply S^(-1/2) to an IP-ADC vector.
+
+    For the 2h1p sector,
+
+        S^(-1/2) = a I + b P
+
+    with
+
+        a = (1 + 1/sqrt(3))/2
+        b = (1 - 1/sqrt(3))/2.
+    """
+
+    x = np.asarray(x)
+    y = np.array(x, copy=True)
+
+    ns = nocc
+
+    r2 = x[ns:].reshape(nvir, nocc, nocc)
+
+    invsqrt3 = 1.0 / np.sqrt(3.0)
+
+    a = 0.5 * (1.0 + invsqrt3)
+    b = 0.5 * (1.0 - invsqrt3)
+
+    y[ns:] = (
+        a * r2
+        + b * r2.transpose(0, 2, 1)
+    ).reshape(-1)
+
+    return y
+
+
+# ============================================================
+# Standard symmetric Lanczos
+# ============================================================
+
+def lanczos(matvec, v0, maxiter=100, tol=1.0e-12,
+            reorthogonalize=True, verbose=True):
+    """
+    Standard symmetric Lanczos algorithm.
+
+    Full two-pass reorthogonalization is used by default.
+
+    Parameters
+    ----------
+    matvec : callable
+        Function returning A @ x for a symmetric matrix A.
+
+    v0 : ndarray
+        Initial vector.
+
+    maxiter : int
+        Maximum Krylov-space dimension.
+
+    tol : float
+        Lanczos breakdown threshold.
+
+    reorthogonalize : bool
+        Perform full two-pass reorthogonalization.
+
+    verbose : bool
+        Print iteration information.
+
+    Returns
+    -------
+    alpha : ndarray
+        Diagonal elements of the Lanczos tridiagonal matrix.
+
+    beta : ndarray
+        Off-diagonal elements.
+
+    Q : ndarray
+        Orthonormal Lanczos vectors stored as columns.
+    """
+
+    q = np.asarray(v0, dtype=float).copy()
+
+    norm = np.linalg.norm(q)
+
+    if norm < tol:
+        raise ValueError("Initial Lanczos vector has zero norm.")
+
+    q /= norm
+
+    n = q.size
+    maxiter = min(maxiter, n)
+
+    Q = np.zeros((n, maxiter), dtype=float)
+
+    alpha = np.zeros(maxiter, dtype=float)
+    beta = np.zeros(maxiter - 1, dtype=float)
+
+    q_prev = np.zeros_like(q)
+    beta_prev = 0.0
+
+    m = 0
+
+    for j in range(maxiter):
+
+        Q[:, j] = q
+
+        # ----------------------------------------------
+        # Matrix-vector product
+        # ----------------------------------------------
+
+        z = np.asarray(matvec(q), dtype=float)
+
+        # ----------------------------------------------
+        # alpha_j
+        # ----------------------------------------------
+
+        alpha[j] = np.dot(q, z)
+
+        # ----------------------------------------------
+        # Three-term recurrence
+        # ----------------------------------------------
+
+        z -= alpha[j] * q
+
+        if j > 0:
+            z -= beta_prev * q_prev
+
+        # ----------------------------------------------
+        # Full reorthogonalization
+        #
+        # Two passes provide robust numerical
+        # orthogonality for validation purposes.
+        # ----------------------------------------------
+
+        if reorthogonalize:
+
+            Qj = Q[:, :j + 1]
+
+            for _ in range(2):
+
+                coeff = Qj.T @ z
+                z -= Qj @ coeff
+
+        b = np.linalg.norm(z)
+
+        m = j + 1
+
+        if verbose:
+
+            print(
+                f"Iteration {j+1:4d}: "
+                f"alpha = {alpha[j]:18.12f}   "
+                f"beta = {b:12.5e}"
+            )
+
+        # ----------------------------------------------
+        # Lanczos breakdown
+        # ----------------------------------------------
+
+        if b < tol:
+
+            if verbose:
+                print(
+                    "\nLanczos breakdown/convergence "
+                    f"after {m} iterations."
+                )
+
+            break
+
+        if j == maxiter - 1:
+            break
+
+        beta[j] = b
+
+        q_prev = q.copy()
+        q = z / b
+        beta_prev = b
+
+    alpha = alpha[:m]
+
+    if m > 1:
+        beta = beta[:m - 1]
+    else:
+        beta = np.empty(0)
+
+    Q = Q[:, :m]
+
+    return alpha, beta, Q
+
+
+# ============================================================
+# Construct Lanczos tridiagonal matrix
+# ============================================================
+
+def make_tridiagonal(alpha, beta):
+    """
+    Construct the symmetric tridiagonal Lanczos matrix.
+    """
+
+    m = len(alpha)
+
+    T = np.diag(alpha.copy())
+
+    if m > 1:
+
+        idx = np.arange(m - 1)
+
+        T[idx, idx + 1] = beta
+        T[idx + 1, idx] = beta
+
+    return T
+
+# ============================================================
+# Symmetric Block-Lanczos
+# ============================================================
+
+def block_lanczos(
+    matvec,
+    V0,
+    max_blocks=20,
+    tol=1.0e-12,
+    reorthogonalize=True,
+    verbose=True,
+):
+    """
+    Symmetric Block-Lanczos with full two-pass
+    reorthogonalization.
+
+    Parameters
+    ----------
+    matvec : callable
+        Function returning H @ x, where H is symmetric.
+
+    V0 : ndarray, shape (n, p)
+        Initial block.
+
+    max_blocks : int
+        Maximum number of Lanczos blocks.
+
+    tol : float
+        Breakdown threshold.
+
+    reorthogonalize : bool
+        Perform full two-pass block reorthogonalization.
+
+    verbose : bool
+        Print iteration information.
+
+    Returns
+    -------
+    A_blocks : list of ndarray
+        Diagonal blocks A_j.
+
+    B_blocks : list of ndarray
+        Off-diagonal blocks B_{j+1}.
+
+        B_blocks[j] couples block j and j+1.
+
+    Q_blocks : list of ndarray
+        Orthonormal Lanczos blocks.
+    """
+
+    V0 = np.asarray(V0, dtype=float)
+
+    if V0.ndim != 2:
+        raise ValueError("V0 must be a two-dimensional array.")
+
+    n, p = V0.shape
+
+    # --------------------------------------------------------
+    # Orthonormalize initial block
+    # --------------------------------------------------------
+
+    Q0, R0 = np.linalg.qr(V0, mode="reduced")
+
+    if np.min(np.abs(np.diag(R0))) < tol:
+        raise ValueError(
+            "Initial block is rank deficient."
+        )
+
+    Q_blocks = [Q0]
+
+    A_blocks = []
+    B_blocks = []
+
+    Q_prev = None
+    B_prev = None
+
+    for j in range(max_blocks):
+
+        Qj = Q_blocks[j]
+
+        # ----------------------------------------------------
+        # H @ Q_j
+        #
+        # Apply matrix-vector product column by column.
+        # ----------------------------------------------------
+
+        Z = np.column_stack(
+            [
+                matvec(Qj[:, k])
+                for k in range(p)
+            ]
+        )
+
+        # ----------------------------------------------------
+        # Diagonal block
+        #
+        # A_j = Q_j^T H Q_j
+        # ----------------------------------------------------
+
+        Aj = Qj.T @ Z
+
+        # Numerical symmetrization only at roundoff level.
+        #
+        # H is already mathematically symmetric.
+        # This merely removes ~machine-precision noise.
+
+        Aj = 0.5 * (Aj + Aj.T)
+
+        A_blocks.append(Aj)
+
+        # ----------------------------------------------------
+        # Three-term block recurrence
+        # ----------------------------------------------------
+
+        W = Z - Qj @ Aj
+
+        if j > 0:
+            W -= Q_prev @ B_prev.T
+
+        # ----------------------------------------------------
+        # Full block reorthogonalization
+        #
+        # For validation we orthogonalize against ALL
+        # previously generated Lanczos blocks.
+        # ----------------------------------------------------
+
+        if reorthogonalize:
+
+            Qall = np.hstack(Q_blocks)
+
+            for _ in range(2):
+
+                C = Qall.T @ W
+                W -= Qall @ C
+
+        # ----------------------------------------------------
+        # QR factorization:
+        #
+        #     W = Q_{j+1} B_{j+1}
+        #
+        # ----------------------------------------------------
+
+        Qnext, Bnext = np.linalg.qr(
+            W,
+            mode="reduced"
+        )
+
+        # ----------------------------------------------------
+        # Diagnose possible block breakdown
+        # ----------------------------------------------------
+
+        singular_values = np.linalg.svd(
+            W,
+            compute_uv=False
+        )
+
+        sigma_min = singular_values[-1]
+        sigma_max = singular_values[0]
+
+        if verbose:
+
+            print()
+            print(
+                f"Block iteration {j+1:4d}"
+            )
+
+            print(
+                "  ||A_j - A_j^T|| = "
+                f"{np.linalg.norm(Aj - Aj.T):12.5e}"
+            )
+
+            print(
+                "  singular values(W): "
+                f"max = {sigma_max:12.5e}   "
+                f"min = {sigma_min:12.5e}"
+            )
+
+        # ----------------------------------------------------
+        # Complete block breakdown
+        # ----------------------------------------------------
+
+        if sigma_max < tol:
+
+            if verbose:
+                print(
+                    "\nComplete Block-Lanczos "
+                    "breakdown/convergence."
+                )
+
+            break
+
+        # ----------------------------------------------------
+        # Partial breakdown
+        #
+        # For this FIRST validation implementation,
+        # stop rather than deflate.
+        # ----------------------------------------------------
+
+        if sigma_min < tol:
+
+            if verbose:
+                print(
+                    "\nPartial block breakdown detected."
+                )
+                print(
+                    "Deflation is not implemented in "
+                    "this validation version."
+                )
+
+            break
+
+        # ----------------------------------------------------
+        # Last requested block
+        # ----------------------------------------------------
+
+        if j == max_blocks - 1:
+            break
+
+        B_blocks.append(Bnext)
+
+        Q_prev = Qj
+        B_prev = Bnext
+
+        Q_blocks.append(Qnext)
+
+    return A_blocks, B_blocks, Q_blocks
+
+
+# ============================================================
+# Construct block-tridiagonal Lanczos matrix
+# ============================================================
+
+def make_block_tridiagonal(A_blocks, B_blocks):
+
+    nb = len(A_blocks)
+
+    if nb == 0:
+        raise ValueError("No Lanczos blocks.")
+
+    p = A_blocks[0].shape[0]
+
+    T = np.zeros(
+        (nb * p, nb * p),
+        dtype=float
+    )
+
+    for j in range(nb):
+
+        s = slice(j*p, (j+1)*p)
+
+        T[s, s] = A_blocks[j]
+
+        if j < nb - 1:
+
+            sp = slice(
+                (j+1)*p,
+                (j+2)*p
+            )
+
+            B = B_blocks[j]
+
+            # lower block
+            T[sp, s] = B
+
+            # upper block
+            T[s, sp] = B.T
+
+    return T
+
+
+# ============================================================
+# Main calculation
+# ============================================================
+
+def main():
+
+    # ========================================================
+    # Molecule
+    # ========================================================
+
+    mol = gto.M(
+        atom="""
+        O   0.000000   0.000000   0.000000
+        H   0.000000  -0.757000   0.587000
+        H   0.000000   0.757000   0.587000
+        """,
+        basis="cc-pvdz",
+        verbose=4,
+    )
+
+    # ========================================================
+    # RHF
+    # ========================================================
+
+    mf = scf.RHF(mol)
+    mf.kernel()
+
+    if not mf.converged:
+        raise RuntimeError("RHF calculation did not converge.")
+
+    # ========================================================
+    # ADC ground-state calculation
+    # ========================================================
+
+    myadc = adc.ADC(mf)
+
+    myadc.method = "adc(2)"
+    myadc.method_type = "ip"
+
+    myadc.kernel_gs()
+
+    # ========================================================
+    # Construct IP-ADC object
+    # ========================================================
+
+    myadcip = radc_ip.RADCIP(myadc)
+
+    nocc = myadcip._nocc
+    nvir = myadcip._nvir
+
+    # ========================================================
+    # Integral transformation / intermediates
+    #
+    # This follows radc.kernel():
+    #
+    #   eris = adc.transform_integrals()
+    #   imds = adc.get_imds(eris)
+    #   matvec, diag = adc.gen_matvec(imds, eris)
+    #
+    # ========================================================
+
+    eris = myadcip.transform_integrals()
+
+    imds = myadcip.get_imds(eris)
+
+    matvec, diag = myadcip.gen_matvec(imds, eris)
+
+    dim = len(diag)
+
+    print()
+    print("========================================")
+    print("IP-ADC dimensions")
+    print("========================================")
+    print(f"nocc             = {nocc}")
+    print(f"nvir             = {nvir}")
+    print(f"1h dimension     = {nocc}")
+    print(f"2h1p dimension   = {nvir*nocc*nocc}")
+    print(f"total dimension  = {dim}")
+
+    # ========================================================
+    # Test S^(1/2) S^(-1/2) = I
+    # ========================================================
+
+    rng = np.random.default_rng(12345)
+
+    x = rng.standard_normal(dim)
+
+    y = apply_invsqrt_metric(x, nocc, nvir)
+    z = apply_sqrt_metric(y, nocc, nvir)
+
+    metric_inverse_error = (
+        np.linalg.norm(z - x) / np.linalg.norm(x)
+    )
+
+    print()
+    print("========================================")
+    print("Metric transformation test")
+    print("========================================")
+
+    print(
+        "||sqrt(S) invsqrt(S) x - x|| / ||x|| =",
+        metric_inverse_error
+    )
+
+    # ========================================================
+    # Symmetrized matrix-vector product
+    #
+    #       A_sym = S^(1/2) A S^(-1/2)
+    #
+    # ========================================================
+
+    def matvec_sym(x):
+
+        y = apply_invsqrt_metric(
+            x, nocc, nvir
+        )
+
+        y = matvec(y)
+
+        y = apply_sqrt_metric(
+            y, nocc, nvir
+        )
+
+        return y
+
+    # ========================================================
+    # Numerical symmetry test
+    # ========================================================
+
+    print()
+    print("========================================")
+    print("Symmetry test for transformed matvec")
+    print("========================================")
+
+    max_sym_error = 0.0
+
+    for k in range(10):
+
+        x = rng.standard_normal(dim)
+        y = rng.standard_normal(dim)
+
+        x /= np.linalg.norm(x)
+        y /= np.linalg.norm(y)
+
+        Ax = matvec_sym(x)
+        Ay = matvec_sym(y)
+
+        lhs = np.dot(x, Ay)
+        rhs = np.dot(Ax, y)
+
+        diff = abs(lhs - rhs)
+
+        max_sym_error = max(
+            max_sym_error,
+            diff
+        )
+
+        print(
+            f"{k:3d}  "
+            f"x^T A_sym y = {lhs:20.12e}  "
+            f"(A_sym x)^T y = {rhs:20.12e}  "
+            f"diff = {lhs-rhs:12.5e}"
+        )
+
+    print()
+    print(
+        "Maximum symmetry error =",
+        max_sym_error
+    )
+
+    # ========================================================
+    # Initial Lanczos vector
+    #
+    # For validation, use the 1h configuration associated
+    # with the smallest diagonal element.
+    #
+    # Since it lies entirely in the 1h sector,
+    #
+    #       S^(1/2) v0 = v0.
+    #
+    # ========================================================
+
+    i0 = np.argmin(diag)
+
+    v0 = np.zeros(dim)
+    v0[i0] = 1.0
+
+    print()
+    print("========================================")
+    print("Lanczos initial vector")
+    print("========================================")
+
+    print("Initial-vector index =", i0)
+    print(
+        "Corresponding diagonal element =",
+        diag[i0]
+    )
+
+    # ========================================================
+    # Lanczos calculation
+    # ========================================================
+
+    maxiter = min(100, dim)
+
+    print()
+    print("========================================")
+    print("Starting symmetric Lanczos")
+    print("========================================")
+
+    alpha, beta, Q = lanczos(
+        matvec_sym,
+        v0,
+        maxiter=maxiter,
+        tol=1.0e-12,
+        reorthogonalize=True,
+        verbose=True,
+    )
+
+    # ========================================================
+    # Tridiagonal matrix
+    # ========================================================
+
+    T = make_tridiagonal(
+        alpha,
+        beta
+    )
+
+    ritz_values, ritz_vectors = np.linalg.eigh(T)
+
+    # ========================================================
+    # Lanczos Ritz values
+    # ========================================================
+
+    print()
+    print("========================================")
+    print("Lowest Lanczos Ritz values")
+    print("========================================")
+
+    nprint = min(
+        10,
+        len(ritz_values)
+    )
+
+    for i in range(nprint):
+
+        e = ritz_values[i]
+
+        print(
+            f"{i:3d}  "
+            f"{e:18.12f} Eh   "
+            f"{e*HARTREE2EV:14.8f} eV"
+        )
+
+    # ========================================================
+    # Orthogonality test
+    # ========================================================
+
+    orth_error = np.linalg.norm(
+        Q.T @ Q
+        - np.eye(Q.shape[1])
+    )
+
+    print()
+    print("========================================")
+    print("Lanczos orthogonality")
+    print("========================================")
+
+    print(
+        "||Q^T Q - I|| =",
+        orth_error
+    )
+
+    # ========================================================
+    # Ritz residuals
+    #
+    #       r_i = A_sym u_i - theta_i u_i
+    #
+    # ========================================================
+
+    print()
+    print("========================================")
+    print("Lanczos Ritz residuals")
+    print("========================================")
+
+    ritz_residuals = []
+
+    for i in range(nprint):
+
+        theta = ritz_values[i]
+
+        y = ritz_vectors[:, i]
+
+        u = Q @ y
+
+        residual = (
+            matvec_sym(u)
+            - theta * u
+        )
+
+        resnorm = np.linalg.norm(
+            residual
+        )
+
+        ritz_residuals.append(
+            resnorm
+        )
+
+        print(
+            f"{i:3d}  "
+            f"E = {theta:18.12f}  "
+            f"residual = {resnorm:12.5e}"
+        )
+
+    # ========================================================
+    # Davidson reference
+    #
+    # This uses the original PySCF IP-ADC representation.
+    # A and A_sym are related by similarity transformation,
+    # so their eigenvalues must be identical.
+    # ========================================================
+
+    nroots = min(100, dim)
+
+    print()
+    print("========================================")
+    print("PySCF Davidson reference")
+    print("========================================")
+
+    E_dav, U_dav, P_dav, X_dav = (
+        myadcip.kernel(
+            nroots=nroots,
+            eris=eris,
+        )
+    )
+
+    # ========================================================
+    # Davidson vs Lanczos
+    # ========================================================
+
+    print()
+    print("========================================")
+    print("Davidson vs Lanczos")
+    print("========================================")
+
+    print(
+        f"{'root':>5s} "
+        f"{'Davidson / Eh':>20s} "
+        f"{'Lanczos / Eh':>20s} "
+        f"{'difference / Eh':>20s} "
+        f"{'residual':>14s}"
+    )
+
+    ncompare = min(
+        nroots,
+        len(ritz_values)
+    )
+
+    for i in range(ncompare):
+
+        diff = (
+            ritz_values[i]
+            - E_dav[i]
+        )
+
+        if i < len(ritz_residuals):
+            residual = ritz_residuals[i]
+        else:
+            residual = np.nan
+
+        print(
+            f"{i:5d} "
+            f"{E_dav[i]:20.12f} "
+            f"{ritz_values[i]:20.12f} "
+            f"{diff:20.6e} "
+            f"{residual:14.5e}"
+        )
+
+    # ========================================================
+    # Optional:
+    # Davidson eigenvectors transformed to symmetric basis
+    #
+    # If A U = E U, then
+    #
+    #     U_sym = S^(1/2) U
+    #
+    # satisfies
+    #
+    #     A_sym U_sym = E U_sym.
+    #
+    # Check this for the Davidson states.
+    # ========================================================
+
+    print()
+    print("========================================")
+    print("Transformed Davidson eigenvector test")
+    print("========================================")
+
+    for i in range(nroots):
+
+        u_original = U_dav[:, i]
+
+        u_sym = apply_sqrt_metric(
+            u_original,
+            nocc,
+            nvir
+        )
+
+        # Normalize in the Euclidean metric of
+        # the transformed representation.
+
+        u_sym /= np.linalg.norm(u_sym)
+
+        residual = (
+            matvec_sym(u_sym)
+            - E_dav[i] * u_sym
+        )
+
+        resnorm = np.linalg.norm(
+            residual
+        )
+
+        overlap = abs(
+            np.dot(v0, u_sym)
+        )
+
+        print(
+            f"{i:3d}  "
+            f"E = {E_dav[i]:18.12f}  "
+            f"residual = {resnorm:12.5e}  "
+            f"|<v0|U_sym>|^2 = {overlap**2:12.5e}"
+        )
+
+
+    # ============================================================
+    # Initial Block-Lanczos block
+    #
+    # For validation use several 1h unit vectors.
+    # ============================================================
+
+#   block_size = min(3, nocc)
+    block_size = nocc
+
+    # Only inspect the 1h diagonal elements.
+    idx = np.argsort(diag[:nocc])[:block_size]
+
+    V0 = np.zeros((dim, block_size))
+    V0[:nocc, :] = np.eye(nocc)
+
+    max_blocks = 50
+
+#   for k, i in enumerate(idx):
+#       V0[i, k] = 1.0
+
+    print()
+    print("========================================")
+    print("Block-Lanczos initial block")
+    print("========================================")
+
+    print("Block size =", block_size)
+    print("1h indices =", idx)
+
+    for k, i in enumerate(idx):
+
+        print(
+            f"column {k:3d}: "
+            f"index = {i:4d}   "
+            f"diag = {diag[i]:18.12f}"
+        )
+
+    print()
+    print(
+        "Initial-block orthogonality error =",
+        np.linalg.norm(
+            V0.T @ V0
+            - np.eye(block_size)
+        )
+    )
+
+
+    # ============================================================
+    # Block-Lanczos
+    # ============================================================
+
+#   max_blocks = min(10, dim // block_size)
+
+    print()
+    print("========================================")
+    print("Starting symmetric Block-Lanczos")
+    print("========================================")
+
+    A_blocks, B_blocks, Q_blocks = block_lanczos(
+        matvec_sym,
+        V0,
+        max_blocks=max_blocks,
+        tol=1.0e-12,
+        reorthogonalize=True,
+        verbose=True,
+    )
+
+    T_block = make_block_tridiagonal(
+        A_blocks,
+        B_blocks
+    )
+
+    ritz_values_block, ritz_vectors_block = (
+        np.linalg.eigh(T_block)
+    )
+
+
+    Q_block = np.hstack(Q_blocks)
+
+    orth_error_block = np.linalg.norm(
+        Q_block.T @ Q_block
+        - np.eye(Q_block.shape[1])
+    )
+
+    print()
+    print("========================================")
+    print("Block-Lanczos orthogonality")
+    print("========================================")
+
+    print(
+        "Krylov dimension =",
+        Q_block.shape[1]
+    )
+
+    print(
+        "||Q^T Q - I|| =",
+        orth_error_block
+    )
+
+
+    HQ = np.column_stack(
+        [
+            matvec_sym(Q_block[:, k])
+            for k in range(Q_block.shape[1])
+        ]
+    )
+
+    T_direct = Q_block.T @ HQ
+
+    print()
+    print("========================================")
+    print("Block projection test")
+    print("========================================")
+
+    print(
+        "||T_direct - T_direct^T|| =",
+        np.linalg.norm(
+            T_direct - T_direct.T
+        )
+    )
+
+    print(
+        "||T_direct - T_block|| =",
+        np.linalg.norm(
+            T_direct - T_block
+        )
+    )
+
+
+    print()
+    print("========================================")
+    print("Lowest Block-Lanczos Ritz values")
+    print("========================================")
+
+    nprint = min(
+        30,
+        len(ritz_values_block)
+    )
+
+    for i in range(nprint):
+
+        e = ritz_values_block[i]
+
+        print(
+            f"{i:3d}  "
+            f"{e:18.12f} Eh   "
+            f"{e*HARTREE2EV:14.8f} eV"
+        )
+
+
+    print()
+    print("========================================")
+    print("Block-Lanczos Ritz residuals")
+    print("========================================")
+
+    block_residuals = []
+
+    for i in range(nprint):
+
+        theta = ritz_values_block[i]
+
+        y = ritz_vectors_block[:, i]
+
+        u = Q_block @ y
+
+        residual = (
+            matvec_sym(u)
+            - theta * u
+        )
+
+        resnorm = np.linalg.norm(
+            residual
+        )
+
+        block_residuals.append(resnorm)
+
+        print(
+            f"{i:3d}  "
+            f"E = {theta:18.12f}   "
+            f"residual = {resnorm:12.5e}"
+        )
+
+
+    print()
+    print("========================================")
+    print("Davidson vs Block-Lanczos")
+    print("========================================")
+
+    print(
+        f"{'BL':>5s} "
+        f"{'Dav':>5s} "
+        f"{'Davidson / Eh':>20s} "
+        f"{'Block-Lanczos / Eh':>22s} "
+        f"{'difference / Eh':>20s} "
+        f"{'residual':>14s}"
+    )
+
+    ncompare = min(
+        30,
+        len(ritz_values_block)
+    )
+
+    for i in range(ncompare):
+
+        theta = ritz_values_block[i]
+
+        # Davidson state closest in energy
+        j = np.argmin(
+            np.abs(E_dav - theta)
+        )
+
+        diff = theta - E_dav[j]
+
+        print(
+            f"{i:5d} "
+            f"{j:5d} "
+            f"{E_dav[j]:20.12f} "
+            f"{theta:22.12f} "
+            f"{diff:20.6e} "
+            f"{block_residuals[i]:14.5e}"
+        )
+
+
+
+# ============================================================
+# Run
+# ============================================================
+
+if __name__ == "__main__":
+    main()
+
+
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='node05', release='6.8.0-110-generic', version='#110-Ubuntu SMP PREEMPT_DYNAMIC Thu Mar 19 15:09:20 UTC 2026', machine='x86_64')  Threads 8
+Python 3.14.7 | packaged by Anaconda, Inc. | (main, Aug 14 2026, 10:21:40) [GCC 14.3.0]
+numpy 2.5.2  scipy 1.18.1  h5py 3.16.0
+Date: Tue Sep 29 16:41:02 2026
+PySCF version 2.14.0
+PySCF path  /home/evgeniy/prog/pyscf
+GIT ORIG_HEAD 34e5aa023afaf42157932b2b0e35e716f7af0b14
+GIT HEAD (branch master) e47d1279f72ffd50cbad43fbfed50511d8415b7e
+
+[ENV] PYSCF_TMPDIR /scratch/evgeniy/pyscf-test
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 3
+[INPUT] num. electrons = 10
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 0
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+[INPUT]  1 O      0.000000000000   0.000000000000   0.000000000000 AA    0.000000000000   0.000000000000   0.000000000000 Bohr   0.0
+[INPUT]  2 H      0.000000000000  -0.757000000000   0.587000000000 AA    0.000000000000  -1.430522676296   1.109269235120 Bohr   0.0
+[INPUT]  3 H      0.000000000000   0.757000000000   0.587000000000 AA    0.000000000000   1.430522676296   1.109269235120 Bohr   0.0
+
+nuclear repulsion = 9.18825841774611
+number of shells = 11
+number of NR pGTOs = 40
+number of NR cGTOs = 24
+basis = cc-pvdz
+ecp = {}
+CPU time:         0.93
+
+
+******** <class 'pyscf.scf.hf.RHF'> ********
+method = RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /scratch/evgeniy/pyscf-test/tmpta6sc55e
+max_memory 4000 MB (current use 128 MB)
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -75.8564886162471
+  HOMO = -0.476818251418631  LUMO = 0.100626554688235  gap/eV = 15.71307
+cycle= 1 E= -75.9878157199693  delta_E= -0.131  |g|= 0.448  |ddm|= 1.31
+  HOMO = -0.412638622054451  LUMO = 0.186492856349365  gap/eV = 16.30320
+cycle= 2 E= -76.0177142185364  delta_E= -0.0299  |g|= 0.228  |ddm|= 0.37
+  HOMO = -0.498200382859054  LUMO = 0.180827609256028  gap/eV = 18.47729
+cycle= 3 E= -76.0265825515462  delta_E= -0.00887  |g|= 0.0245  |ddm|= 0.13
+  HOMO = -0.491201369420484  LUMO = 0.185596353732394  gap/eV = 18.41660
+cycle= 4 E= -76.0267512314625  delta_E= -0.000169  |g|= 0.00587  |ddm|= 0.0181
+  HOMO = -0.492724703264161  LUMO = 0.185526872973994  gap/eV = 18.45617
+cycle= 5 E= -76.0267651795248  delta_E= -1.39e-05  |g|= 0.000977  |ddm|= 0.00645
+  HOMO = -0.493079624821704  LUMO = 0.185443933895607  gap/eV = 18.46357
+cycle= 6 E= -76.0267656607416  delta_E= -4.81e-07  |g|= 0.00015  |ddm|= 0.00138
+  HOMO = -0.493134919327483  LUMO = 0.185437522619838  gap/eV = 18.46490
+cycle= 7 E= -76.0267656729543  delta_E= -1.22e-08  |g|= 1.64e-05  |ddm|= 0.000264
+  HOMO = -0.49313377397677  LUMO = 0.185436743480238  gap/eV = 18.46484
+cycle= 8 E= -76.0267656731085  delta_E= -1.54e-10  |g|= 3.88e-06  |ddm|= 2.65e-05
+  HOMO = -0.493132772871722  LUMO = 0.185436779986021  gap/eV = 18.46482
+Extra cycle  E= -76.0267656731175  delta_E= -9.05e-12  |g|= 1.69e-06  |ddm|= 5.44e-06
+converged SCF energy = -76.0267656731175
+
+******** <class 'pyscf.adc.radc.RADC'> ********
+max_memory 4000 MB (current use 137 MB)
+******** ADC Orbital Information ********
+Number of Frozen Occupied Orbitals: 0
+Number of Frozen Virtual Orbitals: 0
+Number of Active Occupied Orbitals: 5
+Number of Active Virtual Orbitals: 19
+*****************************************
+Reference correlation energy (doubles): -0.20401998
+MP2 correlation energy of reference state (a.u.) = -0.20401998
+
+========================================
+IP-ADC dimensions
+========================================
+nocc             = 5
+nvir             = 19
+1h dimension     = 5
+2h1p dimension   = 475
+total dimension  = 480
+
+========================================
+Metric transformation test
+========================================
+||sqrt(S) invsqrt(S) x - x|| / ||x|| = 1.1628675355997059e-16
+
+========================================
+Symmetry test for transformed matvec
+========================================
+  0  x^T A_sym y =  -3.794878319933e-01  (A_sym x)^T y =  -3.794878319933e-01  diff = -1.66533e-16
+  1  x^T A_sym y =  -2.912234073109e-01  (A_sym x)^T y =  -2.912234073109e-01  diff =  5.55112e-17
+  2  x^T A_sym y =   9.525409262355e-02  (A_sym x)^T y =   9.525409262355e-02  diff = -2.77556e-17
+  3  x^T A_sym y =  -5.560955560541e-01  (A_sym x)^T y =  -5.560955560541e-01  diff =  6.66134e-16
+  4  x^T A_sym y =   3.033610276693e-01  (A_sym x)^T y =   3.033610276693e-01  diff = -1.11022e-16
+  5  x^T A_sym y =   1.732043030274e+00  (A_sym x)^T y =   1.732043030274e+00  diff =  0.00000e+00
+  6  x^T A_sym y =  -1.064201564195e+00  (A_sym x)^T y =  -1.064201564195e+00  diff = -2.22045e-16
+  7  x^T A_sym y =  -6.837535151356e-01  (A_sym x)^T y =  -6.837535151356e-01  diff =  2.22045e-16
+  8  x^T A_sym y =   4.947142666117e-01  (A_sym x)^T y =   4.947142666117e-01  diff =  3.33067e-16
+  9  x^T A_sym y =  -5.977358170879e-01  (A_sym x)^T y =  -5.977358170879e-01  diff = -2.22045e-16
+
+Maximum symmetry error = 6.661338147750939e-16
+
+========================================
+Lanczos initial vector
+========================================
+Initial-vector index = 4
+Corresponding diagonal element = 0.5471442110955741
+
+========================================
+Starting symmetric Lanczos
+========================================
+Iteration    1: alpha =     0.547144211096   beta =  5.36120e-01
+Iteration    2: alpha =     3.444015110100   beta =  4.22325e+00
+Iteration    3: alpha =    29.584787932710   beta =  1.18929e+01
+Iteration    4: alpha =    24.776198144301   beta =  1.28119e+01
+Iteration    5: alpha =    14.685463531601   beta =  2.30008e+00
+Iteration    6: alpha =    12.909126271897   beta =  1.01136e+01
+Iteration    7: alpha =    13.961888483450   beta =  3.43521e+00
+Iteration    8: alpha =    29.097464082452   beta =  1.72258e+01
+Iteration    9: alpha =    19.134144905876   beta =  8.72884e+00
+Iteration   10: alpha =    21.211411274634   beta =  4.31492e+00
+Iteration   11: alpha =    29.356297828288   beta =  1.79137e+01
+Iteration   12: alpha =    18.263276432661   beta =  5.30686e+00
+Iteration   13: alpha =    20.865738915015   beta =  5.87657e+00
+Iteration   14: alpha =     5.985817023138   beta =  4.00503e+00
+Iteration   15: alpha =    20.509028366242   beta =  5.76322e+00
+Iteration   16: alpha =     5.542008026350   beta =  2.87455e+00
+Iteration   17: alpha =    18.869218340628   beta =  7.96313e+00
+Iteration   18: alpha =     7.593650234086   beta =  2.34572e+00
+Iteration   19: alpha =    18.971941997176   beta =  8.40667e+00
+Iteration   20: alpha =     9.009579312767   beta =  2.57124e+00
+Iteration   21: alpha =    16.326817354389   beta =  9.21497e+00
+Iteration   22: alpha =    10.665082472551   beta =  1.46489e+00
+Iteration   23: alpha =    12.626300080035   beta =  9.97885e+00
+Iteration   24: alpha =    14.927924690370   beta =  1.95672e+00
+Iteration   25: alpha =    10.298274455150   beta =  8.90889e+00
+Iteration   26: alpha =    16.804824732946   beta =  1.86434e+00
+Iteration   27: alpha =    20.786711237455   beta =  2.01796e+01
+Iteration   28: alpha =    27.802150244609   beta =  4.06900e+00
+Iteration   29: alpha =    20.674668717150   beta =  5.95442e+00
+Iteration   30: alpha =     6.470959357038   beta =  5.00077e+00
+Iteration   31: alpha =    39.693683340615   beta =  9.12130e+00
+Iteration   32: alpha =    10.171896870741   beta =  9.01352e+00
+Iteration   33: alpha =    22.329382721994   beta =  6.82412e+00
+Iteration   34: alpha =    37.014389976672   beta =  8.89017e+00
+Iteration   35: alpha =     7.838228691332   beta =  6.28585e+00
+Iteration   36: alpha =    28.137836784708   beta =  1.07552e+01
+Iteration   37: alpha =    34.964727950191   beta =  8.64021e+00
+Iteration   38: alpha =     7.047835535489   beta =  4.15069e+00
+Iteration   39: alpha =    39.328825481913   beta =  8.06900e+00
+Iteration   40: alpha =    12.768465524411   beta =  9.81804e+00
+Iteration   41: alpha =    16.834550772906   beta =  5.00081e+00
+Iteration   42: alpha =    40.370218728434   beta =  9.53526e+00
+Iteration   43: alpha =     7.077609064564   beta =  5.42779e+00
+Iteration   44: alpha =    32.136124759220   beta =  1.16189e+01
+Iteration   45: alpha =    24.965010086499   beta =  1.15344e+01
+Iteration   46: alpha =    12.160170850969   beta =  1.71412e+00
+Iteration   47: alpha =    31.914056580000   beta =  1.78123e+01
+Iteration   48: alpha =    15.324392206844   beta =  3.31564e+00
+Iteration   49: alpha =    25.464564116414   beta =  1.03613e+01
+Iteration   50: alpha =    29.428264757186   beta =  1.58208e+01
+Iteration   51: alpha =    14.402354751010   beta =  1.22132e+00
+Iteration   52: alpha =    18.880849945542   beta =  1.88907e+01
+Iteration   53: alpha =    27.203612627505   beta =  1.04577e+00
+Iteration   54: alpha =    14.976447787235   beta =  1.78598e+01
+Iteration   55: alpha =    30.063596270002   beta =  1.01932e+00
+Iteration   56: alpha =    23.907789336599   beta =  1.96881e+01
+Iteration   57: alpha =    21.999167713589   beta =  1.64573e+00
+Iteration   58: alpha =    25.439552595226   beta =  1.76712e+01
+Iteration   59: alpha =    20.848152599137   beta =  7.45541e+00
+Iteration   60: alpha =    26.022576069908   beta =  2.33673e+00
+Iteration   61: alpha =    12.458165035888   beta =  1.62468e+01
+Iteration   62: alpha =    33.873236683086   beta =  2.20347e+00
+Iteration   63: alpha =    14.785625330830   beta =  8.69615e+00
+Iteration   64: alpha =    15.403320148581   beta =  1.28473e+01
+Iteration   65: alpha =    35.305938835430   beta =  3.25569e+00
+Iteration   66: alpha =     4.658841602652   beta =  2.44662e+00
+Iteration   67: alpha =    24.281040570040   beta =  1.08852e+01
+Iteration   68: alpha =    17.925323364374   beta =  1.60294e+01
+Iteration   69: alpha =    28.066628130419   beta =  3.22502e+00
+Iteration   70: alpha =     3.094470481055   beta =  2.36618e+00
+Iteration   71: alpha =    17.452874774461   beta =  7.28719e+00
+Iteration   72: alpha =     6.973123637652   beta =  1.62886e+00
+Iteration   73: alpha =    23.079901413393   beta =  6.42361e+00
+Iteration   74: alpha =     4.594728902192   beta =  1.92788e+00
+Iteration   75: alpha =     3.344438074033   beta =  3.75385e+00
+Iteration   76: alpha =    21.031732159222   beta =  7.32418e+00
+Iteration   77: alpha =     8.386737759935   beta =  3.27227e+00
+Iteration   78: alpha =    16.296209244126   beta =  7.67430e+00
+Iteration   79: alpha =     9.948966362449   beta =  1.05399e+00
+Iteration   80: alpha =    18.526718015709   beta =  9.94640e+00
+Iteration   81: alpha =    10.035774313914   beta =  1.39856e+00
+Iteration   82: alpha =    20.099409108945   beta =  6.66751e+00
+Iteration   83: alpha =     6.676082281412   beta =  4.37171e+00
+Iteration   84: alpha =    23.048545587450   beta =  2.33044e+00
+Iteration   85: alpha =     7.748847999555   beta =  6.96924e+00
+Iteration   86: alpha =    20.291808310679   beta =  2.66932e+00
+Iteration   87: alpha =     9.669028389926   beta =  7.23878e+00
+Iteration   88: alpha =    18.175067020772   beta =  3.49362e+00
+Iteration   89: alpha =     7.865941298194   beta =  8.03486e+00
+Iteration   90: alpha =    20.900260073440   beta =  2.00359e+00
+Iteration   91: alpha =     6.948470844250   beta =  9.39948e+00
+Iteration   92: alpha =    19.441848973360   beta =  1.55024e+00
+Iteration   93: alpha =    11.254264093210   beta =  9.60156e+00
+Iteration   94: alpha =    14.224312584415   beta =  1.84440e+00
+Iteration   95: alpha =    21.049474977302   beta =  7.08905e+00
+Iteration   96: alpha =     5.474138329693   beta =  2.30402e+00
+Iteration   97: alpha =    14.604133910440   beta =  9.63366e+00
+Iteration   98: alpha =    12.065163958497   beta =  2.63190e+00
+Iteration   99: alpha =     9.053072552142   beta =  8.05761e+00
+Iteration  100: alpha =    19.509904090323   beta =  1.80316e+00
+
+========================================
+Lowest Lanczos Ritz values
+========================================
+  0      0.403385993748 Eh      10.97669208 eV
+  1      0.490910435616 Eh      13.35835348 eV
+  2      0.657036088065 Eh      17.87886277 eV
+  3      1.179175842831 Eh      32.08700931 eV
+  4      1.250815004687 Eh      34.03641021 eV
+  5      1.344341992008 Eh      36.58140919 eV
+  6      1.471480452037 Eh      40.04102293 eV
+  7      1.918427081532 Eh      52.20306030 eV
+  8      1.983614565450 Eh      53.97690210 eV
+  9      2.024014910383 Eh      55.07625149 eV
+
+========================================
+Lanczos orthogonality
+========================================
+||Q^T Q - I|| = 5.9112166305509906e-15
+
+========================================
+Lanczos Ritz residuals
+========================================
+  0  E =     0.403385993748  residual =  1.57401e-15
+  1  E =     0.490910435616  residual =  6.86668e-08
+  2  E =     0.657036088065  residual =  1.00983e-07
+  3  E =     1.179175842831  residual =  1.84303e-01
+  4  E =     1.250815004687  residual =  1.56872e-14
+  5  E =     1.344341992008  residual =  1.35466e-01
+  6  E =     1.471480452037  residual =  3.19177e-14
+  7  E =     1.918427081532  residual =  3.52611e-09
+  8  E =     1.983614565450  residual =  6.46083e-08
+  9  E =     2.024014910383  residual =  7.20282e-08
+
+========================================
+PySCF Davidson reference
+========================================
+
+******** <class 'pyscf.adc.radc_ip.RADCIP'> ********
+max_space = 12
+max_cycle = 50
+conv_tol = 1e-08
+max_memory 4000 MB (current use 157 MB)
+
+*************************************************************
+        ADC calculation summary (doublet states only)
+*************************************************************
+adc(2) root 0  |  Energy (Eh) =   0.4033859937  |  Energy (eV) =  10.97669199  |  Spec. factor = 1.81611862  |  conv = True
+adc(2) root 1  |  Energy (Eh) =   0.4909104358  |  Energy (eV) =  13.35835337  |  Spec. factor = 1.82734004  |  conv = True
+adc(2) root 2  |  Energy (Eh) =   0.6570360881  |  Energy (eV) =  17.87886262  |  Spec. factor = 1.85818550  |  conv = True
+adc(2) root 3  |  Energy (Eh) =   1.1589258845  |  Energy (eV) =  31.53597961  |  Spec. factor = 0.50027584  |  conv = True
+adc(2) root 4  |  Energy (Eh) =   1.2043287777  |  Energy (eV) =  32.77145527  |  Spec. factor = 1.27096108  |  conv = True
+adc(2) root 5  |  Energy (Eh) =   1.2425999795  |  Energy (eV) =  33.81286771  |  Spec. factor = 0.00055726  |  conv = True
+adc(2) root 6  |  Energy (Eh) =   1.2452122465  |  Energy (eV) =  33.88395112  |  Spec. factor = 0.00002486  |  conv = True
+adc(2) root 7  |  Energy (Eh) =   1.2508150047  |  Energy (eV) =  34.03640993  |  Spec. factor = 0.01079072  |  conv = True
+adc(2) root 8  |  Energy (Eh) =   1.3159405863  |  Energy (eV) =  35.80856727  |  Spec. factor = 0.00009101  |  conv = True
+adc(2) root 9  |  Energy (Eh) =   1.3159405863  |  Energy (eV) =  35.80856727  |  Spec. factor = 0.00000682  |  conv = True
+adc(2) root 10  |  Energy (Eh) =   1.3220320730  |  Energy (eV) =  35.97432507  |  Spec. factor = 0.00699693  |  conv = True
+adc(2) root 11  |  Energy (Eh) =   1.3773237978  |  Energy (eV) =  37.47888954  |  Spec. factor = 0.00003131  |  conv = True
+adc(2) root 12  |  Energy (Eh) =   1.3773237978  |  Energy (eV) =  37.47888954  |  Spec. factor = 0.00002674  |  conv = True
+adc(2) root 13  |  Energy (Eh) =   1.3894966309  |  Energy (eV) =  37.81012920  |  Spec. factor = 0.00043544  |  conv = True
+adc(2) root 14  |  Energy (Eh) =   1.4480521377  |  Energy (eV) =  39.40350570  |  Spec. factor = 0.00000052  |  conv = True
+adc(2) root 15  |  Energy (Eh) =   1.4508337185  |  Energy (eV) =  39.47919637  |  Spec. factor = 0.00023865  |  conv = True
+adc(2) root 16  |  Energy (Eh) =   1.4544978506  |  Energy (eV) =  39.57890248  |  Spec. factor = 0.00850033  |  conv = True
+adc(2) root 17  |  Energy (Eh) =   1.4714804520  |  Energy (eV) =  40.04102260  |  Spec. factor = 0.04019502  |  conv = True
+adc(2) root 18  |  Energy (Eh) =   1.5237562142  |  Energy (eV) =  41.46351855  |  Spec. factor = 0.01159869  |  conv = True
+adc(2) root 19  |  Energy (Eh) =   1.5432219228  |  Energy (eV) =  41.99320746  |  Spec. factor = 0.03825639  |  conv = True
+adc(2) root 20  |  Energy (Eh) =   1.5829787540  |  Energy (eV) =  43.07504594  |  Spec. factor = 0.00052647  |  conv = True
+adc(2) root 21  |  Energy (Eh) =   1.6642021688  |  Energy (eV) =  45.28524763  |  Spec. factor = 0.02118110  |  conv = True
+adc(2) root 22  |  Energy (Eh) =   1.7748999157  |  Energy (eV) =  48.29748675  |  Spec. factor = 0.00027272  |  conv = True
+adc(2) root 23  |  Energy (Eh) =   1.8429818774  |  Energy (eV) =  50.15009130  |  Spec. factor = 0.00676380  |  conv = True
+adc(2) root 24  |  Energy (Eh) =   1.8482803094  |  Energy (eV) =  50.29426897  |  Spec. factor = 0.00000759  |  conv = True
+adc(2) root 25  |  Energy (Eh) =   1.8482803094  |  Energy (eV) =  50.29426897  |  Spec. factor = 0.00045382  |  conv = True
+adc(2) root 26  |  Energy (Eh) =   1.9139036178  |  Energy (eV) =  52.07997015  |  Spec. factor = 0.00010398  |  conv = True
+adc(2) root 27  |  Energy (Eh) =   1.9184270815  |  Energy (eV) =  52.20305987  |  Spec. factor = 0.00480739  |  conv = True
+adc(2) root 28  |  Energy (Eh) =   1.9218202755  |  Energy (eV) =  52.29539338  |  Spec. factor = 0.00135991  |  conv = True
+adc(2) root 29  |  Energy (Eh) =   1.9803918607  |  Energy (eV) =  53.88920739  |  Spec. factor = 0.00000824  |  conv = True
+adc(2) root 30  |  Energy (Eh) =   1.9836145654  |  Energy (eV) =  53.97690166  |  Spec. factor = 0.00347007  |  conv = True
+adc(2) root 31  |  Energy (Eh) =   1.9900127197  |  Energy (eV) =  54.15100430  |  Spec. factor = 0.00319983  |  conv = True
+adc(2) root 32  |  Energy (Eh) =   2.0149918080  |  Energy (eV) =  54.83071992  |  Spec. factor = 0.00001842  |  conv = True
+adc(2) root 33  |  Energy (Eh) =   2.0240149104  |  Energy (eV) =  55.07625104  |  Spec. factor = 0.01022324  |  conv = True
+adc(2) root 34  |  Energy (Eh) =   2.0460151691  |  Energy (eV) =  55.67490857  |  Spec. factor = 0.00028939  |  conv = True
+adc(2) root 35  |  Energy (Eh) =   2.0460151691  |  Energy (eV) =  55.67490857  |  Spec. factor = 0.00047647  |  conv = True
+adc(2) root 36  |  Energy (Eh) =   2.0568225043  |  Energy (eV) =  55.96899114  |  Spec. factor = 0.00414847  |  conv = True
+adc(2) root 37  |  Energy (Eh) =   2.0627816152  |  Energy (eV) =  56.13114681  |  Spec. factor = 0.01387010  |  conv = True
+adc(2) root 38  |  Energy (Eh) =   2.0857201479  |  Energy (eV) =  56.75533607  |  Spec. factor = 0.00000541  |  conv = True
+adc(2) root 39  |  Energy (Eh) =   2.0857201479  |  Energy (eV) =  56.75533607  |  Spec. factor = 0.00013791  |  conv = True
+adc(2) root 40  |  Energy (Eh) =   2.0934539905  |  Energy (eV) =  56.96578465  |  Spec. factor = 0.00941216  |  conv = True
+adc(2) root 41  |  Energy (Eh) =   2.0966399155  |  Energy (eV) =  57.05247809  |  Spec. factor = 0.01197339  |  conv = True
+adc(2) root 42  |  Energy (Eh) =   2.1195250899  |  Energy (eV) =  57.67521540  |  Spec. factor = 0.00136549  |  conv = True
+adc(2) root 43  |  Energy (Eh) =   2.1219300322  |  Energy (eV) =  57.74065721  |  Spec. factor = 0.00294239  |  conv = True
+adc(2) root 44  |  Energy (Eh) =   2.1505945516  |  Energy (eV) =  58.52065852  |  Spec. factor = 0.00130946  |  conv = True
+adc(2) root 45  |  Energy (Eh) =   2.1592300686  |  Energy (eV) =  58.75564290  |  Spec. factor = 0.00018182  |  conv = True
+adc(2) root 46  |  Energy (Eh) =   2.1597357838  |  Energy (eV) =  58.76940411  |  Spec. factor = 0.00054987  |  conv = True
+adc(2) root 47  |  Energy (Eh) =   2.1860900166  |  Energy (eV) =  59.48653932  |  Spec. factor = 0.00263565  |  conv = True
+adc(2) root 48  |  Energy (Eh) =   2.1992621492  |  Energy (eV) =  59.84497130  |  Spec. factor = 0.00703948  |  conv = True
+adc(2) root 49  |  Energy (Eh) =   2.2206132801  |  Energy (eV) =  60.42596517  |  Spec. factor = 0.00018175  |  conv = True
+adc(2) root 50  |  Energy (Eh) =   2.2234036843  |  Energy (eV) =  60.50189593  |  Spec. factor = 0.00007543  |  conv = True
+adc(2) root 51  |  Energy (Eh) =   2.2272907649  |  Energy (eV) =  60.60766878  |  Spec. factor = 0.00756875  |  conv = True
+adc(2) root 52  |  Energy (Eh) =   2.2397343574  |  Energy (eV) =  60.94627618  |  Spec. factor = 0.00008788  |  conv = True
+adc(2) root 53  |  Energy (Eh) =   2.2538583615  |  Energy (eV) =  61.33060991  |  Spec. factor = 0.00435427  |  conv = True
+adc(2) root 54  |  Energy (Eh) =   2.2575930887  |  Energy (eV) =  61.43223701  |  Spec. factor = 0.04842134  |  conv = True
+adc(2) root 55  |  Energy (Eh) =   2.2603383105  |  Energy (eV) =  61.50693830  |  Spec. factor = 0.00034878  |  conv = True
+adc(2) root 56  |  Energy (Eh) =   2.2778990180  |  Energy (eV) =  61.98478949  |  Spec. factor = 0.00940925  |  conv = True
+adc(2) root 57  |  Energy (Eh) =   2.2913288345  |  Energy (eV) =  62.35023341  |  Spec. factor = 0.00015099  |  conv = True
+adc(2) root 58  |  Energy (Eh) =   2.3078993576  |  Energy (eV) =  62.80114031  |  Spec. factor = 0.02868717  |  conv = True
+adc(2) root 59  |  Energy (Eh) =   2.3132159422  |  Energy (eV) =  62.94581195  |  Spec. factor = 0.00001182  |  conv = True
+adc(2) root 60  |  Energy (Eh) =   2.3132159422  |  Energy (eV) =  62.94581195  |  Spec. factor = 0.00000661  |  conv = True
+adc(2) root 61  |  Energy (Eh) =   2.3315632295  |  Energy (eV) =  63.44506707  |  Spec. factor = 0.05563128  |  conv = True
+adc(2) root 62  |  Energy (Eh) =   2.3337692241  |  Energy (eV) =  63.50509524  |  Spec. factor = 0.00029019  |  conv = True
+adc(2) root 63  |  Energy (Eh) =   2.3555152356  |  Energy (eV) =  64.09683435  |  Spec. factor = 0.00012281  |  conv = True
+adc(2) root 64  |  Energy (Eh) =   2.3555152356  |  Energy (eV) =  64.09683435  |  Spec. factor = 0.00005833  |  conv = True
+adc(2) root 65  |  Energy (Eh) =   2.3867313046  |  Energy (eV) =  64.94626686  |  Spec. factor = 0.00003818  |  conv = True
+adc(2) root 66  |  Energy (Eh) =   2.3922410730  |  Energy (eV) =  65.09619529  |  Spec. factor = 0.00003327  |  conv = True
+adc(2) root 67  |  Energy (Eh) =   2.4061722226  |  Energy (eV) =  65.47528118  |  Spec. factor = 0.00930201  |  conv = True
+adc(2) root 68  |  Energy (Eh) =   2.4290251563  |  Energy (eV) =  66.09714118  |  Spec. factor = 0.00012386  |  conv = True
+adc(2) root 69  |  Energy (Eh) =   2.4306319091  |  Energy (eV) =  66.14086315  |  Spec. factor = 0.00100677  |  conv = True
+adc(2) root 70  |  Energy (Eh) =   2.4453274935  |  Energy (eV) =  66.54075037  |  Spec. factor = 0.00001565  |  conv = True
+adc(2) root 71  |  Energy (Eh) =   2.4508989187  |  Energy (eV) =  66.69235657  |  Spec. factor = 0.03682131  |  conv = True
+adc(2) root 72  |  Energy (Eh) =   2.4626634736  |  Energy (eV) =  67.01248642  |  Spec. factor = 0.00029337  |  conv = True
+adc(2) root 73  |  Energy (Eh) =   2.4627245263  |  Energy (eV) =  67.01414774  |  Spec. factor = 0.02259052  |  conv = True
+adc(2) root 74  |  Energy (Eh) =   2.4657509938  |  Energy (eV) =  67.09650212  |  Spec. factor = 0.00000112  |  conv = True
+adc(2) root 75  |  Energy (Eh) =   2.4657509938  |  Energy (eV) =  67.09650212  |  Spec. factor = 0.00001852  |  conv = True
+adc(2) root 76  |  Energy (Eh) =   2.5036081771  |  Energy (eV) =  68.12664855  |  Spec. factor = 0.00002685  |  conv = True
+adc(2) root 77  |  Energy (Eh) =   2.5053021039  |  Energy (eV) =  68.17274265  |  Spec. factor = 0.00329581  |  conv = True
+adc(2) root 78  |  Energy (Eh) =   2.5189867807  |  Energy (eV) =  68.54512167  |  Spec. factor = 0.00022571  |  conv = True
+adc(2) root 79  |  Energy (Eh) =   2.5324229462  |  Energy (eV) =  68.91073836  |  Spec. factor = 0.01844514  |  conv = True
+adc(2) root 80  |  Energy (Eh) =   2.5361733944  |  Energy (eV) =  69.01279325  |  Spec. factor = 0.00010521  |  conv = True
+adc(2) root 81  |  Energy (Eh) =   2.5363087301  |  Energy (eV) =  69.01647592  |  Spec. factor = 0.00055726  |  conv = True
+adc(2) root 82  |  Energy (Eh) =   2.5619935724  |  Energy (eV) =  69.71539608  |  Spec. factor = 0.00126193  |  conv = True
+adc(2) root 83  |  Energy (Eh) =   2.5791210560  |  Energy (eV) =  70.18145865  |  Spec. factor = 0.00324967  |  conv = True
+adc(2) root 84  |  Energy (Eh) =   2.5978794520  |  Energy (eV) =  70.69190060  |  Spec. factor = 0.00005276  |  conv = True
+adc(2) root 85  |  Energy (Eh) =   2.6096833151  |  Energy (eV) =  71.01310008  |  Spec. factor = 0.00002218  |  conv = True
+adc(2) root 86  |  Energy (Eh) =   2.6180598710  |  Energy (eV) =  71.24103777  |  Spec. factor = 0.00003215  |  conv = True
+adc(2) root 87  |  Energy (Eh) =   2.6180598710  |  Energy (eV) =  71.24103777  |  Spec. factor = 0.00006303  |  conv = True
+adc(2) root 88  |  Energy (Eh) =   2.6357197284  |  Energy (eV) =  71.72158697  |  Spec. factor = 0.00000100  |  conv = True
+adc(2) root 89  |  Energy (Eh) =   2.6357197284  |  Energy (eV) =  71.72158697  |  Spec. factor = 0.00010046  |  conv = True
+adc(2) root 90  |  Energy (Eh) =   2.6568690955  |  Energy (eV) =  72.29709056  |  Spec. factor = 0.00753421  |  conv = True
+adc(2) root 91  |  Energy (Eh) =   2.6604159299  |  Energy (eV) =  72.39360484  |  Spec. factor = 0.00035471  |  conv = True
+adc(2) root 92  |  Energy (Eh) =   2.6684299317  |  Energy (eV) =  72.61167694  |  Spec. factor = 0.00102552  |  conv = True
+adc(2) root 93  |  Energy (Eh) =   2.6727232644  |  Energy (eV) =  72.72850447  |  Spec. factor = 0.00514879  |  conv = True
+adc(2) root 94  |  Energy (Eh) =   2.6836831793  |  Energy (eV) =  73.02673895  |  Spec. factor = 0.00003507  |  conv = True
+adc(2) root 95  |  Energy (Eh) =   2.6888637888  |  Energy (eV) =  73.16771051  |  Spec. factor = 0.00620484  |  conv = True
+adc(2) root 96  |  Energy (Eh) =   2.6915697917  |  Energy (eV) =  73.24134460  |  Spec. factor = 0.00009498  |  conv = True
+adc(2) root 97  |  Energy (Eh) =   2.6962742247  |  Energy (eV) =  73.36935875  |  Spec. factor = 0.00472651  |  conv = True
+adc(2) root 98  |  Energy (Eh) =   2.7092296492  |  Energy (eV) =  73.72189380  |  Spec. factor = 0.00016900  |  conv = True
+adc(2) root 99  |  Energy (Eh) =   2.7131626807  |  Energy (eV) =  73.82891704  |  Spec. factor = 0.00660223  |  conv = True
+
+========================================
+Davidson vs Lanczos
+========================================
+ root        Davidson / Eh         Lanczos / Eh      difference / Eh       residual
+    0       0.403385993748       0.403385993748         7.660539e-15    1.57401e-15
+    1       0.490910435804       0.490910435616        -1.870938e-10    6.86668e-08
+    2       0.657036088065       0.657036088065         1.110223e-15    1.00983e-07
+    3       1.158925884518       1.179175842831         2.024996e-02    1.84303e-01
+    4       1.204328777749       1.250815004687         4.648623e-02    1.56872e-14
+    5       1.242599979471       1.344341992008         1.017420e-01    1.35466e-01
+    6       1.245212246475       1.471480452037         2.262682e-01    3.19177e-14
+    7       1.250815004687       1.918427081532         6.676121e-01    3.52611e-09
+    8       1.315940586347       1.983614565450         6.676740e-01    6.46083e-08
+    9       1.315940586347       2.024014910383         7.080743e-01    7.20282e-08
+   10       1.322032072959       2.199262149174         8.772301e-01            nan
+   11       1.377323797800       2.257593088665         8.802693e-01            nan
+   12       1.377323797800       2.333769244220         9.564454e-01            nan
+   13       1.389496630949       2.462724594289         1.073228e+00            nan
+   14       1.448052137673       2.505305185270         1.057253e+00            nan
+   15       1.450833718545       2.604008691670         1.153175e+00            nan
+   16       1.454497850636       2.686575187197         1.232077e+00            nan
+   17       1.471480452037       2.701613318088         1.230133e+00            nan
+   18       1.523756214221       2.801322086503         1.277566e+00            nan
+   19       1.543221922831       2.928198846659         1.384977e+00            nan
+   20       1.582978753970       2.989140274518         1.406162e+00            nan
+   21       1.664202168809       3.059464662803         1.395262e+00            nan
+   22       1.774899915730       3.107522531715         1.332623e+00            nan
+   23       1.842981877445       3.275360740648         1.432379e+00            nan
+   24       1.848280309410       3.511466146112         1.663186e+00            nan
+   25       1.848280309410       3.527584894109         1.679305e+00            nan
+   26       1.913903617780       3.576201542597         1.662298e+00            nan
+   27       1.918427081532       3.643080443609         1.724653e+00            nan
+   28       1.921820275523       3.703201440641         1.781381e+00            nan
+   29       1.980391860736       3.873706466374         1.893315e+00            nan
+   30       1.983614565450       4.271896482539         2.288282e+00            nan
+   31       1.990012719699       4.320907035193         2.330894e+00            nan
+   32       2.014991808029       4.346918568303         2.331927e+00            nan
+   33       2.024014910383       4.419263766683         2.395249e+00            nan
+   34       2.046015169105       4.570006935568         2.523992e+00            nan
+   35       2.046015169105       4.603537485232         2.557522e+00            nan
+   36       2.056822504297       4.683085425629         2.626263e+00            nan
+   37       2.062781615243       4.924738458675         2.861957e+00            nan
+   38       2.085720147901       5.190641639476         3.104921e+00            nan
+   39       2.085720147901       5.339391901759         3.253672e+00            nan
+   40       2.093453990471       5.340308620742         3.246855e+00            nan
+   41       2.096639915527       5.374815983115         3.278176e+00            nan
+   42       2.119525089851       5.695773017129         3.576248e+00            nan
+   43       2.121930032212       5.958500106468         3.836570e+00            nan
+   44       2.150594551602       6.145009014222         3.994414e+00            nan
+   45       2.159230068646       6.537291800410         4.378062e+00            nan
+   46       2.159735783773       6.820176556549         4.660441e+00            nan
+   47       2.186090016626      19.837983219437         1.765189e+01            nan
+   48       2.199262149172      21.229176370565         1.902991e+01            nan
+   49       2.220613280099      21.230709880293         1.901010e+01            nan
+   50       2.223403684274      21.299913427950         1.907651e+01            nan
+   51       2.227290764934      21.389003478004         1.916171e+01            nan
+   52       2.239734357389      21.449775269878         1.921004e+01            nan
+   53       2.253858361536      21.832541625033         1.957868e+01            nan
+   54       2.257593088657      21.897872744476         1.964028e+01            nan
+   55       2.260338310525      22.207365719078         1.994703e+01            nan
+   56       2.277899018039      22.317603496151         2.003970e+01            nan
+   57       2.291328834494      22.487575167915         2.019625e+01            nan
+   58       2.307899357567      22.683105610588         2.037521e+01            nan
+   59       2.313215942174      22.725755672285         2.041254e+01            nan
+   60       2.313215942174      22.791265157944         2.047805e+01            nan
+   61       2.331563229537      22.910975472559         2.057941e+01            nan
+   62       2.333769224081      23.087454120853         2.075368e+01            nan
+   63       2.355515235599      23.532653915669         2.117714e+01            nan
+   64       2.355515235599      23.561039173864         2.120552e+01            nan
+   65       2.386731304589      23.731734279364         2.134500e+01            nan
+   66       2.392241073042      24.198966052591         2.180672e+01            nan
+   67       2.406172222624      24.402841476293         2.199667e+01            nan
+   68       2.429025156344      24.533740501019         2.210472e+01            nan
+   69       2.430631909058      24.553830677790         2.212320e+01            nan
+   70       2.445327493499      24.587271871081         2.214194e+01            nan
+   71       2.450898918662      24.908174439275         2.245728e+01            nan
+   72       2.462663473642      24.990067769345         2.252740e+01            nan
+   73       2.462724526253      25.121969354339         2.265924e+01            nan
+   74       2.465750993787      25.172596756421         2.270685e+01            nan
+   75       2.465750993787      25.264842992535         2.279909e+01            nan
+   76       2.503608177081      25.401104977326         2.289750e+01            nan
+   77       2.505302103932      25.751436653483         2.324613e+01            nan
+   78       2.518986780690      25.752431280985         2.323344e+01            nan
+   79       2.532422946241      26.034275454995         2.350185e+01            nan
+   80       2.536173394388      26.034331923935         2.349816e+01            nan
+   81       2.536308730149      41.287663010751         3.875135e+01            nan
+   82       2.561993572399      41.357363782319         3.879537e+01            nan
+   83       2.579121055977      41.889703227119         3.931058e+01            nan
+   84       2.597879451994      41.956135011084         3.935826e+01            nan
+   85       2.609683315133      42.265247300227         3.965556e+01            nan
+   86       2.618059870964      42.301585011185         3.968353e+01            nan
+   87       2.618059870964      42.354649622737         3.973659e+01            nan
+   88       2.635719728407      42.546217365171         3.991050e+01            nan
+   89       2.635719728407      42.577593701811         3.994187e+01            nan
+   90       2.656869095526      42.775214633510         4.011835e+01            nan
+   91       2.660415929891      42.972854282637         4.031244e+01            nan
+   92       2.668429931661      43.035925140617         4.036750e+01            nan
+   93       2.672723264448      43.552262892083         4.087954e+01            nan
+   94       2.683683179334      43.592067759448         4.090838e+01            nan
+   95       2.688863788806      44.386771739423         4.169791e+01            nan
+   96       2.691569791710      44.439094592985         4.174752e+01            nan
+   97       2.696274224746      44.611294309275         4.191502e+01            nan
+   98       2.709229649152      44.965721757835         4.225649e+01            nan
+   99       2.713162680683      45.248499664007         4.253534e+01            nan
+
+========================================
+Transformed Davidson eigenvector test
+========================================
+  0  E =     0.403385993748  residual =  2.88732e-14  |<v0|U_sym>|^2 =  9.19172e-01
+  1  E =     0.490910435804  residual =  2.43861e-08  |<v0|U_sym>|^2 =  9.69028e-30
+  2  E =     0.657036088065  residual =  1.60523e-14  |<v0|U_sym>|^2 =  7.14754e-33
+  3  E =     1.158925884518  residual =  1.23359e-08  |<v0|U_sym>|^2 =  8.58813e-31
+  4  E =     1.204328777749  residual =  2.05799e-08  |<v0|U_sym>|^2 =  5.84985e-32
+  5  E =     1.242599979471  residual =  1.24373e-14  |<v0|U_sym>|^2 =  1.11832e-28
+  6  E =     1.245212246475  residual =  1.27560e-14  |<v0|U_sym>|^2 =  3.77504e-28
+  7  E =     1.250815004687  residual =  1.65920e-14  |<v0|U_sym>|^2 =  5.34387e-03
+  8  E =     1.315940586347  residual =  9.53338e-15  |<v0|U_sym>|^2 =  2.27261e-29
+  9  E =     1.315940586347  residual =  8.39812e-15  |<v0|U_sym>|^2 =  1.99410e-30
+ 10  E =     1.322032072959  residual =  4.84647e-09  |<v0|U_sym>|^2 =  1.23400e-30
+ 11  E =     1.377323797800  residual =  6.76096e-15  |<v0|U_sym>|^2 =  2.51043e-29
+ 12  E =     1.377323797800  residual =  9.31643e-15  |<v0|U_sym>|^2 =  4.11451e-29
+ 13  E =     1.389496630949  residual =  1.45640e-14  |<v0|U_sym>|^2 =  3.78358e-30
+ 14  E =     1.448052137673  residual =  1.60895e-14  |<v0|U_sym>|^2 =  1.28941e-28
+ 15  E =     1.450833718545  residual =  1.66849e-14  |<v0|U_sym>|^2 =  9.37417e-30
+ 16  E =     1.454497850636  residual =  1.40563e-14  |<v0|U_sym>|^2 =  1.25886e-32
+ 17  E =     1.471480452037  residual =  1.92738e-14  |<v0|U_sym>|^2 =  1.97517e-02
+ 18  E =     1.523756214221  residual =  2.11103e-09  |<v0|U_sym>|^2 =  2.22885e-29
+ 19  E =     1.543221922831  residual =  1.51174e-08  |<v0|U_sym>|^2 =  1.21138e-30
+ 20  E =     1.582978753970  residual =  6.50476e-10  |<v0|U_sym>|^2 =  1.32805e-30
+ 21  E =     1.664202168809  residual =  2.58416e-14  |<v0|U_sym>|^2 =  3.79973e-31
+ 22  E =     1.774899915730  residual =  1.93381e-14  |<v0|U_sym>|^2 =  1.14124e-30
+ 23  E =     1.842981877445  residual =  2.22687e-09  |<v0|U_sym>|^2 =  5.65117e-32
+ 24  E =     1.848280309410  residual =  1.30109e-14  |<v0|U_sym>|^2 =  3.37280e-31
+ 25  E =     1.848280309410  residual =  1.18758e-14  |<v0|U_sym>|^2 =  2.92821e-30
+ 26  E =     1.913903617780  residual =  1.70759e-14  |<v0|U_sym>|^2 =  4.28209e-27
+ 27  E =     1.918427081532  residual =  1.70680e-14  |<v0|U_sym>|^2 =  2.23506e-03
+ 28  E =     1.921820275523  residual =  2.46010e-14  |<v0|U_sym>|^2 =  6.87062e-27
+ 29  E =     1.980391860736  residual =  1.87689e-14  |<v0|U_sym>|^2 =  1.44317e-26
+ 30  E =     1.983614565450  residual =  1.89199e-14  |<v0|U_sym>|^2 =  1.38100e-03
+ 31  E =     1.990012719699  residual =  5.82267e-09  |<v0|U_sym>|^2 =  2.93623e-29
+ 32  E =     2.014991808029  residual =  1.86163e-14  |<v0|U_sym>|^2 =  3.38833e-27
+ 33  E =     2.024014910383  residual =  4.06953e-14  |<v0|U_sym>|^2 =  4.87345e-03
+ 34  E =     2.046015169105  residual =  1.34775e-14  |<v0|U_sym>|^2 =  8.26324e-30
+ 35  E =     2.046015169105  residual =  1.70294e-14  |<v0|U_sym>|^2 =  5.45695e-32
+ 36  E =     2.056822504297  residual =  5.56152e-09  |<v0|U_sym>|^2 =  2.83089e-30
+ 37  E =     2.062781615243  residual =  4.13538e-09  |<v0|U_sym>|^2 =  9.99066e-31
+ 38  E =     2.085720147901  residual =  9.33527e-15  |<v0|U_sym>|^2 =  1.07460e-29
+ 39  E =     2.085720147901  residual =  1.88590e-14  |<v0|U_sym>|^2 =  5.53074e-30
+ 40  E =     2.093453990471  residual =  4.65644e-09  |<v0|U_sym>|^2 =  4.82456e-31
+ 41  E =     2.096639915527  residual =  1.00900e-08  |<v0|U_sym>|^2 =  5.32904e-31
+ 42  E =     2.119525089851  residual =  1.55747e-14  |<v0|U_sym>|^2 =  7.74813e-32
+ 43  E =     2.121930032212  residual =  3.47535e-12  |<v0|U_sym>|^2 =  3.21493e-31
+ 44  E =     2.150594551602  residual =  1.76493e-09  |<v0|U_sym>|^2 =  6.90473e-32
+ 45  E =     2.159230068646  residual =  1.37584e-14  |<v0|U_sym>|^2 =  3.98470e-30
+ 46  E =     2.159735783773  residual =  3.25148e-12  |<v0|U_sym>|^2 =  1.16064e-30
+ 47  E =     2.186090016626  residual =  1.98296e-12  |<v0|U_sym>|^2 =  5.81122e-32
+ 48  E =     2.199262149172  residual =  1.40185e-12  |<v0|U_sym>|^2 =  2.95980e-03
+ 49  E =     2.220613280099  residual =  1.09886e-14  |<v0|U_sym>|^2 =  7.65548e-32
+ 50  E =     2.223403684274  residual =  1.44567e-14  |<v0|U_sym>|^2 =  4.63322e-28
+ 51  E =     2.227290764934  residual =  4.27539e-11  |<v0|U_sym>|^2 =  1.08188e-30
+ 52  E =     2.239734357389  residual =  4.34368e-12  |<v0|U_sym>|^2 =  8.98544e-29
+ 53  E =     2.253858361536  residual =  6.12849e-09  |<v0|U_sym>|^2 =  1.59003e-27
+ 54  E =     2.257593088657  residual =  1.44478e-11  |<v0|U_sym>|^2 =  2.17770e-02
+ 55  E =     2.260338310525  residual =  2.57179e-09  |<v0|U_sym>|^2 =  2.75765e-27
+ 56  E =     2.277899018039  residual =  1.48304e-08  |<v0|U_sym>|^2 =  1.00422e-30
+ 57  E =     2.291328834494  residual =  5.55811e-10  |<v0|U_sym>|^2 =  3.30417e-31
+ 58  E =     2.307899357567  residual =  4.34274e-08  |<v0|U_sym>|^2 =  1.78178e-31
+ 59  E =     2.313215942174  residual =  8.64375e-15  |<v0|U_sym>|^2 =  2.59093e-29
+ 60  E =     2.313215942174  residual =  5.09898e-15  |<v0|U_sym>|^2 =  4.65822e-30
+ 61  E =     2.331563229537  residual =  5.45598e-08  |<v0|U_sym>|^2 =  1.01136e-31
+ 62  E =     2.333769224081  residual =  5.78922e-12  |<v0|U_sym>|^2 =  9.56062e-05
+ 63  E =     2.355515235599  residual =  9.47494e-15  |<v0|U_sym>|^2 =  1.11154e-29
+ 64  E =     2.355515235599  residual =  7.25993e-15  |<v0|U_sym>|^2 =  4.46115e-31
+ 65  E =     2.386731304589  residual =  1.32746e-11  |<v0|U_sym>|^2 =  4.37903e-29
+ 66  E =     2.392241073042  residual =  9.99999e-15  |<v0|U_sym>|^2 =  7.78496e-31
+ 67  E =     2.406172222624  residual =  1.64904e-09  |<v0|U_sym>|^2 =  4.09596e-29
+ 68  E =     2.429025156344  residual =  1.18494e-14  |<v0|U_sym>|^2 =  8.61278e-30
+ 69  E =     2.430631909058  residual =  5.97056e-08  |<v0|U_sym>|^2 =  4.54207e-30
+ 70  E =     2.445327493499  residual =  1.36721e-14  |<v0|U_sym>|^2 =  4.93956e-28
+ 71  E =     2.450898918662  residual =  8.38429e-09  |<v0|U_sym>|^2 =  9.30979e-31
+ 72  E =     2.462663473642  residual =  1.56763e-14  |<v0|U_sym>|^2 =  7.73205e-25
+ 73  E =     2.462724526253  residual =  1.57861e-09  |<v0|U_sym>|^2 =  1.01026e-02
+ 74  E =     2.465750993787  residual =  5.37998e-15  |<v0|U_sym>|^2 =  2.15524e-28
+ 75  E =     2.465750993787  residual =  9.23423e-15  |<v0|U_sym>|^2 =  3.64202e-29
+ 76  E =     2.503608177081  residual =  2.93208e-14  |<v0|U_sym>|^2 =  2.33213e-25
+ 77  E =     2.505302103932  residual =  1.88587e-09  |<v0|U_sym>|^2 =  1.35511e-03
+ 78  E =     2.518986780690  residual =  1.20000e-07  |<v0|U_sym>|^2 =  5.99374e-31
+ 79  E =     2.532422946241  residual =  5.54918e-07  |<v0|U_sym>|^2 =  1.11736e-29
+ 80  E =     2.536173394388  residual =  9.43428e-15  |<v0|U_sym>|^2 =  1.54399e-30
+ 81  E =     2.536308730149  residual =  4.41499e-09  |<v0|U_sym>|^2 =  3.53809e-33
+ 82  E =     2.561993572399  residual =  5.29258e-07  |<v0|U_sym>|^2 =  1.79003e-29
+ 83  E =     2.579121055977  residual =  1.18725e-06  |<v0|U_sym>|^2 =  9.43006e-30
+ 84  E =     2.597879451994  residual =  2.82990e-09  |<v0|U_sym>|^2 =  9.71408e-06
+ 85  E =     2.609683315133  residual =  1.50423e-14  |<v0|U_sym>|^2 =  5.75303e-31
+ 86  E =     2.618059870964  residual =  5.99255e-15  |<v0|U_sym>|^2 =  2.03303e-33
+ 87  E =     2.618059870964  residual =  1.19135e-14  |<v0|U_sym>|^2 =  1.63897e-34
+ 88  E =     2.635719728407  residual =  4.35586e-15  |<v0|U_sym>|^2 =  2.20129e-31
+ 89  E =     2.635719728407  residual =  9.21090e-15  |<v0|U_sym>|^2 =  5.56521e-31
+ 90  E =     2.656869095526  residual =  5.33735e-07  |<v0|U_sym>|^2 =  5.43938e-31
+ 91  E =     2.660415929891  residual =  7.58705e-08  |<v0|U_sym>|^2 =  5.95962e-05
+ 92  E =     2.668429931661  residual =  4.32976e-06  |<v0|U_sym>|^2 =  2.91763e-32
+ 93  E =     2.672723264448  residual =  7.09870e-06  |<v0|U_sym>|^2 =  3.37382e-30
+ 94  E =     2.683683179334  residual =  9.60950e-15  |<v0|U_sym>|^2 =  2.16094e-28
+ 95  E =     2.688863788806  residual =  1.99042e-06  |<v0|U_sym>|^2 =  2.78318e-03
+ 96  E =     2.691569791710  residual =  1.11293e-14  |<v0|U_sym>|^2 =  6.09718e-30
+ 97  E =     2.696274224746  residual =  1.54664e-06  |<v0|U_sym>|^2 =  4.41411e-30
+ 98  E =     2.709229649152  residual =  2.24296e-14  |<v0|U_sym>|^2 =  4.28566e-30
+ 99  E =     2.713162680683  residual =  3.03416e-06  |<v0|U_sym>|^2 =  1.98526e-30
+
+========================================
+Block-Lanczos initial block
+========================================
+Block size = 5
+1h indices = [4 3 2 1 0]
+column   0: index =    4   diag =     0.547144211096
+column   1: index =    3   diag =     0.622656028798
+column   2: index =    2   diag =     0.758169795391
+column   3: index =    1   diag =     1.369618834024
+column   4: index =    0   diag =    20.551980967027
+
+Initial-block orthogonality error = 0.0
+
+========================================
+Starting symmetric Block-Lanczos
+========================================
+
+Block iteration    1
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.43480e+00   min =  4.55320e-01
+
+Block iteration    2
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  7.10029e+00   min =  2.94356e+00
+
+Block iteration    3
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.18929e+01   min =  4.81145e+00
+
+Block iteration    4
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.28119e+01   min =  4.70560e+00
+
+Block iteration    5
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.15965e+01   min =  2.30008e+00
+
+Block iteration    6
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.31025e+01   min =  8.84876e+00
+
+Block iteration    7
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.08056e+01   min =  3.27959e+00
+
+Block iteration    8
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.72258e+01   min =  4.66797e+00
+
+Block iteration    9
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.42113e+01   min =  6.76801e+00
+
+Block iteration   10
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.04234e+01   min =  3.60487e+00
+
+Block iteration   11
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.79137e+01   min =  5.97166e+00
+
+Block iteration   12
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.65883e+01   min =  2.74397e+00
+
+Block iteration   13
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.20343e+00   min =  3.21151e+00
+
+Block iteration   14
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  7.53578e+00   min =  2.61681e+00
+
+Block iteration   15
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.62333e+00   min =  4.08974e+00
+
+Block iteration   16
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  8.25335e+00   min =  2.30836e+00
+
+Block iteration   17
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.72404e+00   min =  3.21172e+00
+
+Block iteration   18
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  6.82662e+00   min =  2.03128e+00
+
+Block iteration   19
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.53641e+00   min =  2.81560e+00
+
+Block iteration   20
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.00069e+01   min =  2.02510e+00
+
+Block iteration   21
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.38500e+00   min =  1.62672e+00
+
+Block iteration   22
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.75550e+00   min =  1.46489e+00
+
+Block iteration   23
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.97885e+00   min =  1.61654e+00
+
+Block iteration   24
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  7.08515e+00   min =  1.51443e+00
+
+Block iteration   25
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.35923e+00   min =  2.65410e+00
+
+Block iteration   26
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.11475e+01   min =  1.04686e+00
+
+Block iteration   27
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.85025e+00   min =  3.82859e+00
+
+Block iteration   28
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.68146e+00   min =  1.48900e+00
+
+Block iteration   29
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.46098e+01   min =  1.14572e+00
+
+Block iteration   30
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.22953e+00   min =  2.34497e+00
+
+Block iteration   31
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  8.62747e+00   min =  1.48313e+00
+
+Block iteration   32
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  8.51580e+00   min =  1.83732e+00
+
+Block iteration   33
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.29608e+00   min =  1.07834e+00
+
+Block iteration   34
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  1.02799e+01   min =  1.31065e+00
+
+Block iteration   35
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.23578e+00   min =  1.10826e+00
+
+Block iteration   36
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.01202e+00   min =  9.09894e-01
+
+Block iteration   37
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  7.51431e+00   min =  8.92035e-01
+
+Block iteration   38
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  6.47743e+00   min =  1.06008e+00
+
+Block iteration   39
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.39146e+00   min =  1.53451e+00
+
+Block iteration   40
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  7.74673e+00   min =  8.10433e-01
+
+Block iteration   41
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  7.50993e+00   min =  4.25244e-01
+
+Block iteration   42
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.46029e+00   min =  3.40185e-01
+
+Block iteration   43
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  3.10321e+00   min =  4.71721e-01
+
+Block iteration   44
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  8.07498e+00   min =  3.22114e-01
+
+Block iteration   45
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  2.45533e+00   min =  3.98188e-01
+
+Block iteration   46
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  9.09760e+00   min =  2.37956e-01
+
+Block iteration   47
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  7.08188e+00   min =  1.14283e+00
+
+Block iteration   48
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  8.39465e+00   min =  1.16125e+00
+
+Block iteration   49
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  5.43174e+00   min =  9.49197e-01
+
+Block iteration   50
+  ||A_j - A_j^T|| =  0.00000e+00
+  singular values(W): max =  5.39016e+00   min =  7.59500e-01
+
+========================================
+Block-Lanczos orthogonality
+========================================
+Krylov dimension = 250
+||Q^T Q - I|| = 1.416237912510569e-14
+
+========================================
+Block projection test
+========================================
+||T_direct - T_direct^T|| = 5.559108855979603e-14
+||T_direct - T_block|| = 2.2985319052694093e-13
+
+========================================
+Lowest Block-Lanczos Ritz values
+========================================
+  0      0.403385993748 Eh      10.97669208 eV
+  1      0.490910435616 Eh      13.35835348 eV
+  2      0.657036088065 Eh      17.87886277 eV
+  3      1.158925884478 Eh      31.53597987 eV
+  4      1.204328777641 Eh      32.77145554 eV
+  5      1.242599987643 Eh      33.81286821 eV
+  6      1.250815004687 Eh      34.03641021 eV
+  7      1.322032072956 Eh      35.97432537 eV
+  8      1.389527734922 Eh      37.81097589 eV
+  9      1.454499790737 Eh      39.57895560 eV
+ 10      1.471480452037 Eh      40.04102293 eV
+ 11      1.523756214220 Eh      41.46351889 eV
+ 12      1.543221922805 Eh      41.99320780 eV
+ 13      1.582978753970 Eh      43.07504629 eV
+ 14      1.664219869834 Eh      45.28572968 eV
+ 15      1.782260359351 Eh      48.49777503 eV
+ 16      1.842981877444 Eh      50.15009171 eV
+ 17      1.918427190327 Eh      52.20306326 eV
+ 18      1.983629278246 Eh      53.97730246 eV
+ 19      1.990012720113 Eh      54.15100476 eV
+ 20      2.024024544335 Eh      55.07651365 eV
+ 21      2.056822515241 Eh      55.96899190 eV
+ 22      2.062781625848 Eh      56.13114756 eV
+ 23      2.093453992145 Eh      56.96578517 eV
+ 24      2.096639918041 Eh      57.05247863 eV
+ 25      2.098604113931 Eh      57.10592712 eV
+ 26      2.150596408631 Eh      58.52070953 eV
+ 27      2.199726245678 Eh      59.85760051 eV
+ 28      2.209045333283 Eh      60.11118580 eV
+ 29      2.253862851809 Eh      61.33073261 eV
+
+========================================
+Block-Lanczos Ritz residuals
+========================================
+  0  E =     0.403385993748   residual =  3.52997e-14
+  1  E =     0.490910435616   residual =  1.63941e-14
+  2  E =     0.657036088065   residual =  1.49670e-10
+  3  E =     1.158925884478   residual =  1.92188e-11
+  4  E =     1.204328777641   residual =  2.68650e-11
+  5  E =     1.242599987643   residual =  1.34809e-04
+  6  E =     1.250815004687   residual =  5.20559e-10
+  7  E =     1.322032072956   residual =  8.73883e-11
+  8  E =     1.389527734922   residual =  7.61590e-03
+  9  E =     1.454499790737   residual =  1.81268e-03
+ 10  E =     1.471480452037   residual =  1.00335e-08
+ 11  E =     1.523756214220   residual =  8.26719e-09
+ 12  E =     1.543221922805   residual =  1.23175e-09
+ 13  E =     1.582978753970   residual =  1.59811e-08
+ 14  E =     1.664219869834   residual =  4.29498e-03
+ 15  E =     1.782260359351   residual =  7.07158e-02
+ 16  E =     1.842981877444   residual =  1.90653e-06
+ 17  E =     1.918427190327   residual =  4.35304e-04
+ 18  E =     1.983629278246   residual =  4.74382e-03
+ 19  E =     1.990012720113   residual =  3.57285e-05
+ 20  E =     2.024024544335   residual =  3.66038e-03
+ 21  E =     2.056822515241   residual =  1.59568e-04
+ 22  E =     2.062781625848   residual =  2.25599e-04
+ 23  E =     2.093453992145   residual =  7.41833e-05
+ 24  E =     2.096639918041   residual =  1.09868e-04
+ 25  E =     2.098604113931   residual =  1.85443e-01
+ 26  E =     2.150596408631   residual =  2.40811e-03
+ 27  E =     2.199726245678   residual =  1.80056e-02
+ 28  E =     2.209045333283   residual =  1.77906e-01
+ 29  E =     2.253862851809   residual =  3.14433e-03
+
+========================================
+Davidson vs Block-Lanczos
+========================================
+   BL   Dav        Davidson / Eh     Block-Lanczos / Eh      difference / Eh       residual
+    0     0       0.403385993748         0.403385993748         1.676437e-14    3.52997e-14
+    1     1       0.490910435804         0.490910435616        -1.870948e-10    1.63941e-14
+    2     2       0.657036088065         0.657036088065        -9.214851e-15    1.49670e-10
+    3     3       1.158925884518         1.158925884478        -3.998402e-11    1.92188e-11
+    4     4       1.204328777749         1.204328777641        -1.082838e-10    2.68650e-11
+    5     5       1.242599979471         1.242599987643         8.172751e-09    1.34809e-04
+    6     7       1.250815004687         1.250815004687        -1.998401e-15    5.20559e-10
+    7    10       1.322032072959         1.322032072956        -2.909450e-12    8.73883e-11
+    8    13       1.389496630949         1.389527734922         3.110397e-05    7.61590e-03
+    9    16       1.454497850636         1.454499790737         1.940101e-06    1.81268e-03
+   10    17       1.471480452037         1.471480452037         1.110223e-14    1.00335e-08
+   11    18       1.523756214221         1.523756214220        -1.117328e-12    8.26719e-09
+   12    19       1.543221922831         1.543221922805        -2.641221e-11    1.23175e-09
+   13    20       1.582978753970         1.582978753970        -4.551914e-14    1.59811e-08
+   14    21       1.664202168809         1.664219869834         1.770102e-05    4.29498e-03
+   15    22       1.774899915730         1.782260359351         7.360444e-03    7.07158e-02
+   16    23       1.842981877445         1.842981877444        -7.327472e-13    1.90653e-06
+   17    27       1.918427081532         1.918427190327         1.087945e-07    4.35304e-04
+   18    30       1.983614565450         1.983629278246         1.471280e-05    4.74382e-03
+   19    31       1.990012719699         1.990012720113         4.142815e-10    3.57285e-05
+   20    33       2.024014910383         2.024024544335         9.633952e-06    3.66038e-03
+   21    36       2.056822504297         2.056822515241         1.094342e-08    1.59568e-04
+   22    37       2.062781615243         2.062781625848         1.060564e-08    2.25599e-04
+   23    40       2.093453990471         2.093453992145         1.673423e-09    7.41833e-05
+   24    41       2.096639915527         2.096639918041         2.514263e-09    1.09868e-04
+   25    41       2.096639915527         2.098604113931         1.964198e-03    1.85443e-01
+   26    44       2.150594551602         2.150596408631         1.857029e-06    2.40811e-03
+   27    48       2.199262149172         2.199726245678         4.640965e-04    1.80056e-02
+   28    48       2.199262149172         2.209045333283         9.783184e-03    1.77906e-01
+   29    53       2.253858361536         2.253862851809         4.490274e-06    3.14433e-03
+The job finished:  Tue Sep 29 16:41:05 CEST 2026

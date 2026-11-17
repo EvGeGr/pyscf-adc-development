@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "/home/evgeniy/prog/pyscf/pyscf/adc/mytest/ip_adc_block_lanczos.py", line 710, in <module>
+    results = run_test(
+        adc_ip,
+    ...<2 lines>...
+        block_size=3,
+    )
+  File "/home/evgeniy/prog/pyscf/pyscf/adc/mytest/ip_adc_block_lanczos.py", line 540, in run_test
+    matvec, diag = adc_ip.gen_matvec()
+                   ^^^^^^^^^^^^^^^^^
+AttributeError: 'RADC' object has no attribute 'gen_matvec'

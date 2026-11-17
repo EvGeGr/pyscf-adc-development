@@ -1,0 +1,1057 @@
+#INFO: **** input file is /home/evgeniy/prog/pyscf/pyscf/adc/test_lanczos/ip_adc_lanczos_cor.py ****
+#!/usr/bin/env python3
+
+"""
+ip_adc_lanczos.py
+
+Validation of a symmetric Lanczos implementation for PySCF IP-ADC.
+
+PySCF's restricted IP-ADC matrix representation is not symmetric
+with respect to the ordinary Euclidean scalar product. Instead,
+
+    A^T S = S A
+
+with
+
+    S = diag(I_1h, 2 I - P_jk)
+
+where P_jk exchanges the two occupied indices of a 2h1p
+amplitude r[a,j,k].
+
+Since S is positive definite, define
+
+    A_sym = S^(1/2) A S^(-1/2).
+
+A_sym is symmetric and has exactly the same eigenvalues as A.
+
+This script:
+    1. Runs RHF and ADC(2)
+    2. Constructs the IP-ADC matvec
+    3. Implements S^(+/-1/2) matrix-free
+    4. Constructs a symmetric transformed matvec
+    5. Tests symmetry numerically
+    6. Runs standard symmetric Lanczos
+    7. Compares Lanczos Ritz values with PySCF Davidson
+    8. Computes Ritz residual norms
+    9. Checks Lanczos-basis orthogonality
+
+The explicit ADC matrix is NOT constructed during Lanczos.
+"""
+
+import numpy as np
+
+from pyscf import gto, scf, adc
+from pyscf.adc import radc_ip
+
+
+HARTREE2EV = 27.211386245988
+
+
+# ============================================================
+# Metric transformations
+# ============================================================
+
+def apply_sqrt_metric(x, nocc, nvir):
+    """
+    Apply S^(1/2) to an IP-ADC vector.
+
+    The IP vector is
+
+        x = (x_1h, x_2h1p)
+
+    and
+
+        S = diag(I, 2I - P_jk).
+
+    For the 2h1p sector,
+
+        S^(1/2) = a I + b P
+
+    with
+
+        a = (1 + sqrt(3))/2
+        b = (1 - sqrt(3))/2.
+    """
+
+    x = np.asarray(x)
+    y = np.array(x, copy=True)
+
+    ns = nocc
+
+    r2 = x[ns:].reshape(nvir, nocc, nocc)
+
+    sqrt3 = np.sqrt(3.0)
+
+    a = 0.5 * (1.0 + sqrt3)
+    b = 0.5 * (1.0 - sqrt3)
+
+    y[ns:] = (
+        a * r2
+        + b * r2.transpose(0, 2, 1)
+    ).reshape(-1)
+
+    return y
+
+
+def apply_invsqrt_metric(x, nocc, nvir):
+    """
+    Apply S^(-1/2) to an IP-ADC vector.
+
+    For the 2h1p sector,
+
+        S^(-1/2) = a I + b P
+
+    with
+
+        a = (1 + 1/sqrt(3))/2
+        b = (1 - 1/sqrt(3))/2.
+    """
+
+    x = np.asarray(x)
+    y = np.array(x, copy=True)
+
+    ns = nocc
+
+    r2 = x[ns:].reshape(nvir, nocc, nocc)
+
+    invsqrt3 = 1.0 / np.sqrt(3.0)
+
+    a = 0.5 * (1.0 + invsqrt3)
+    b = 0.5 * (1.0 - invsqrt3)
+
+    y[ns:] = (
+        a * r2
+        + b * r2.transpose(0, 2, 1)
+    ).reshape(-1)
+
+    return y
+
+
+# ============================================================
+# Standard symmetric Lanczos
+# ============================================================
+
+def lanczos(matvec, v0, maxiter=100, tol=1.0e-12,
+            reorthogonalize=True, verbose=True):
+    """
+    Standard symmetric Lanczos algorithm.
+
+    Full two-pass reorthogonalization is used by default.
+
+    Parameters
+    ----------
+    matvec : callable
+        Function returning A @ x for a symmetric matrix A.
+
+    v0 : ndarray
+        Initial vector.
+
+    maxiter : int
+        Maximum Krylov-space dimension.
+
+    tol : float
+        Lanczos breakdown threshold.
+
+    reorthogonalize : bool
+        Perform full two-pass reorthogonalization.
+
+    verbose : bool
+        Print iteration information.
+
+    Returns
+    -------
+    alpha : ndarray
+        Diagonal elements of the Lanczos tridiagonal matrix.
+
+    beta : ndarray
+        Off-diagonal elements.
+
+    Q : ndarray
+        Orthonormal Lanczos vectors stored as columns.
+    """
+
+    q = np.asarray(v0, dtype=float).copy()
+
+    norm = np.linalg.norm(q)
+
+    if norm < tol:
+        raise ValueError("Initial Lanczos vector has zero norm.")
+
+    q /= norm
+
+    n = q.size
+    maxiter = min(maxiter, n)
+
+    Q = np.zeros((n, maxiter), dtype=float)
+
+    alpha = np.zeros(maxiter, dtype=float)
+    beta = np.zeros(maxiter - 1, dtype=float)
+
+    q_prev = np.zeros_like(q)
+    beta_prev = 0.0
+
+    m = 0
+
+    for j in range(maxiter):
+
+        Q[:, j] = q
+
+        # ----------------------------------------------
+        # Matrix-vector product
+        # ----------------------------------------------
+
+        z = np.asarray(matvec(q), dtype=float)
+
+        # ----------------------------------------------
+        # alpha_j
+        # ----------------------------------------------
+
+        alpha[j] = np.dot(q, z)
+
+        # ----------------------------------------------
+        # Three-term recurrence
+        # ----------------------------------------------
+
+        z -= alpha[j] * q
+
+        if j > 0:
+            z -= beta_prev * q_prev
+
+        # ----------------------------------------------
+        # Full reorthogonalization
+        #
+        # Two passes provide robust numerical
+        # orthogonality for validation purposes.
+        # ----------------------------------------------
+
+        if reorthogonalize:
+
+            Qj = Q[:, :j + 1]
+
+            for _ in range(2):
+
+                coeff = Qj.T @ z
+                z -= Qj @ coeff
+
+        b = np.linalg.norm(z)
+
+        m = j + 1
+
+        if verbose:
+
+            print(
+                f"Iteration {j+1:4d}: "
+                f"alpha = {alpha[j]:18.12f}   "
+                f"beta = {b:12.5e}"
+            )
+
+        # ----------------------------------------------
+        # Lanczos breakdown
+        # ----------------------------------------------
+
+        if b < tol:
+
+            if verbose:
+                print(
+                    "\nLanczos breakdown/convergence "
+                    f"after {m} iterations."
+                )
+
+            break
+
+        if j == maxiter - 1:
+            break
+
+        beta[j] = b
+
+        q_prev = q.copy()
+        q = z / b
+        beta_prev = b
+
+    alpha = alpha[:m]
+
+    if m > 1:
+        beta = beta[:m - 1]
+    else:
+        beta = np.empty(0)
+
+    Q = Q[:, :m]
+
+    return alpha, beta, Q
+
+
+# ============================================================
+# Construct Lanczos tridiagonal matrix
+# ============================================================
+
+def make_tridiagonal(alpha, beta):
+    """
+    Construct the symmetric tridiagonal Lanczos matrix.
+    """
+
+    m = len(alpha)
+
+    T = np.diag(alpha.copy())
+
+    if m > 1:
+
+        idx = np.arange(m - 1)
+
+        T[idx, idx + 1] = beta
+        T[idx + 1, idx] = beta
+
+    return T
+
+
+# ============================================================
+# Main calculation
+# ============================================================
+
+def main():
+
+    # ========================================================
+    # Molecule
+    # ========================================================
+
+    mol = gto.M(
+        atom="""
+        O   0.000000   0.000000   0.000000
+        H   0.000000  -0.757000   0.587000
+        H   0.000000   0.757000   0.587000
+        """,
+        basis="cc-pvdz",
+        verbose=4,
+    )
+
+    # ========================================================
+    # RHF
+    # ========================================================
+
+    mf = scf.RHF(mol)
+    mf.kernel()
+
+    if not mf.converged:
+        raise RuntimeError("RHF calculation did not converge.")
+
+    # ========================================================
+    # ADC ground-state calculation
+    # ========================================================
+
+    myadc = adc.ADC(mf)
+
+    myadc.method = "adc(2)"
+    myadc.method_type = "ip"
+
+    myadc.kernel_gs()
+
+    # ========================================================
+    # Construct IP-ADC object
+    # ========================================================
+
+    myadcip = radc_ip.RADCIP(myadc)
+
+    nocc = myadcip._nocc
+    nvir = myadcip._nvir
+
+    # ========================================================
+    # Integral transformation / intermediates
+    #
+    # This follows radc.kernel():
+    #
+    #   eris = adc.transform_integrals()
+    #   imds = adc.get_imds(eris)
+    #   matvec, diag = adc.gen_matvec(imds, eris)
+    #
+    # ========================================================
+
+    eris = myadcip.transform_integrals()
+
+    imds = myadcip.get_imds(eris)
+
+    matvec, diag = myadcip.gen_matvec(imds, eris)
+
+    dim = len(diag)
+
+    print()
+    print("========================================")
+    print("IP-ADC dimensions")
+    print("========================================")
+    print(f"nocc             = {nocc}")
+    print(f"nvir             = {nvir}")
+    print(f"1h dimension     = {nocc}")
+    print(f"2h1p dimension   = {nvir*nocc*nocc}")
+    print(f"total dimension  = {dim}")
+
+    # ========================================================
+    # Test S^(1/2) S^(-1/2) = I
+    # ========================================================
+
+    rng = np.random.default_rng(12345)
+
+    x = rng.standard_normal(dim)
+
+    y = apply_invsqrt_metric(x, nocc, nvir)
+    z = apply_sqrt_metric(y, nocc, nvir)
+
+    metric_inverse_error = (
+        np.linalg.norm(z - x) / np.linalg.norm(x)
+    )
+
+    print()
+    print("========================================")
+    print("Metric transformation test")
+    print("========================================")
+
+    print(
+        "||sqrt(S) invsqrt(S) x - x|| / ||x|| =",
+        metric_inverse_error
+    )
+
+    # ========================================================
+    # Symmetrized matrix-vector product
+    #
+    #       A_sym = S^(1/2) A S^(-1/2)
+    #
+    # ========================================================
+
+    def matvec_sym(x):
+
+        y = apply_invsqrt_metric(
+            x, nocc, nvir
+        )
+
+        y = matvec(y)
+
+        y = apply_sqrt_metric(
+            y, nocc, nvir
+        )
+
+        return y
+
+    # ========================================================
+    # Numerical symmetry test
+    # ========================================================
+
+    print()
+    print("========================================")
+    print("Symmetry test for transformed matvec")
+    print("========================================")
+
+    max_sym_error = 0.0
+
+    for k in range(10):
+
+        x = rng.standard_normal(dim)
+        y = rng.standard_normal(dim)
+
+        x /= np.linalg.norm(x)
+        y /= np.linalg.norm(y)
+
+        Ax = matvec_sym(x)
+        Ay = matvec_sym(y)
+
+        lhs = np.dot(x, Ay)
+        rhs = np.dot(Ax, y)
+
+        diff = abs(lhs - rhs)
+
+        max_sym_error = max(
+            max_sym_error,
+            diff
+        )
+
+        print(
+            f"{k:3d}  "
+            f"x^T A_sym y = {lhs:20.12e}  "
+            f"(A_sym x)^T y = {rhs:20.12e}  "
+            f"diff = {lhs-rhs:12.5e}"
+        )
+
+    print()
+    print(
+        "Maximum symmetry error =",
+        max_sym_error
+    )
+
+    # ========================================================
+    # Initial Lanczos vector
+    #
+    # For validation, use the 1h configuration associated
+    # with the smallest diagonal element.
+    #
+    # Since it lies entirely in the 1h sector,
+    #
+    #       S^(1/2) v0 = v0.
+    #
+    # ========================================================
+
+    i0 = np.argmin(diag)
+
+    v0 = np.zeros(dim)
+    v0[i0] = 1.0
+
+    print()
+    print("========================================")
+    print("Lanczos initial vector")
+    print("========================================")
+
+    print("Initial-vector index =", i0)
+    print(
+        "Corresponding diagonal element =",
+        diag[i0]
+    )
+
+    # ========================================================
+    # Lanczos calculation
+    # ========================================================
+
+    maxiter = min(100, dim)
+
+    print()
+    print("========================================")
+    print("Starting symmetric Lanczos")
+    print("========================================")
+
+    alpha, beta, Q = lanczos(
+        matvec_sym,
+        v0,
+        maxiter=maxiter,
+        tol=1.0e-12,
+        reorthogonalize=True,
+        verbose=True,
+    )
+
+    # ========================================================
+    # Tridiagonal matrix
+    # ========================================================
+
+    T = make_tridiagonal(
+        alpha,
+        beta
+    )
+
+    ritz_values, ritz_vectors = np.linalg.eigh(T)
+
+    # ========================================================
+    # Lanczos Ritz values
+    # ========================================================
+
+    print()
+    print("========================================")
+    print("Lowest Lanczos Ritz values")
+    print("========================================")
+
+    nprint = min(
+        10,
+        len(ritz_values)
+    )
+
+    for i in range(nprint):
+
+        e = ritz_values[i]
+
+        print(
+            f"{i:3d}  "
+            f"{e:18.12f} Eh   "
+            f"{e*HARTREE2EV:14.8f} eV"
+        )
+
+    # ========================================================
+    # Orthogonality test
+    # ========================================================
+
+    orth_error = np.linalg.norm(
+        Q.T @ Q
+        - np.eye(Q.shape[1])
+    )
+
+    print()
+    print("========================================")
+    print("Lanczos orthogonality")
+    print("========================================")
+
+    print(
+        "||Q^T Q - I|| =",
+        orth_error
+    )
+
+    # ========================================================
+    # Ritz residuals
+    #
+    #       r_i = A_sym u_i - theta_i u_i
+    #
+    # ========================================================
+
+    print()
+    print("========================================")
+    print("Lanczos Ritz residuals")
+    print("========================================")
+
+    ritz_residuals = []
+
+    for i in range(nprint):
+
+        theta = ritz_values[i]
+
+        y = ritz_vectors[:, i]
+
+        u = Q @ y
+
+        residual = (
+            matvec_sym(u)
+            - theta * u
+        )
+
+        resnorm = np.linalg.norm(
+            residual
+        )
+
+        ritz_residuals.append(
+            resnorm
+        )
+
+        print(
+            f"{i:3d}  "
+            f"E = {theta:18.12f}  "
+            f"residual = {resnorm:12.5e}"
+        )
+
+    # ========================================================
+    # Davidson reference
+    #
+    # This uses the original PySCF IP-ADC representation.
+    # A and A_sym are related by similarity transformation,
+    # so their eigenvalues must be identical.
+    # ========================================================
+
+    nroots = min(10, dim)
+
+    print()
+    print("========================================")
+    print("PySCF Davidson reference")
+    print("========================================")
+
+    E_dav, U_dav, P_dav, X_dav = (
+        myadcip.kernel(
+            nroots=nroots,
+            eris=eris,
+        )
+    )
+
+    # ========================================================
+    # Davidson vs Lanczos
+    # ========================================================
+
+    print()
+    print("========================================")
+    print("Davidson vs Lanczos")
+    print("========================================")
+
+    print(
+        f"{'root':>5s} "
+        f"{'Davidson / Eh':>20s} "
+        f"{'Lanczos / Eh':>20s} "
+        f"{'difference / Eh':>20s} "
+        f"{'residual':>14s}"
+    )
+
+    ncompare = min(
+        nroots,
+        len(ritz_values)
+    )
+
+    for i in range(ncompare):
+
+        diff = (
+            ritz_values[i]
+            - E_dav[i]
+        )
+
+        if i < len(ritz_residuals):
+            residual = ritz_residuals[i]
+        else:
+            residual = np.nan
+
+        print(
+            f"{i:5d} "
+            f"{E_dav[i]:20.12f} "
+            f"{ritz_values[i]:20.12f} "
+            f"{diff:20.6e} "
+            f"{residual:14.5e}"
+        )
+
+    # ========================================================
+    # Optional:
+    # Davidson eigenvectors transformed to symmetric basis
+    #
+    # If A U = E U, then
+    #
+    #     U_sym = S^(1/2) U
+    #
+    # satisfies
+    #
+    #     A_sym U_sym = E U_sym.
+    #
+    # Check this for the Davidson states.
+    # ========================================================
+
+    print()
+    print("========================================")
+    print("Transformed Davidson eigenvector test")
+    print("========================================")
+
+    for i in range(nroots):
+
+        u_original = U_dav[:, i]
+
+        u_sym = apply_sqrt_metric(
+            u_original,
+            nocc,
+            nvir
+        )
+
+        # Normalize in the Euclidean metric of
+        # the transformed representation.
+
+        u_sym /= np.linalg.norm(u_sym)
+
+        residual = (
+            matvec_sym(u_sym)
+            - E_dav[i] * u_sym
+        )
+
+        resnorm = np.linalg.norm(
+            residual
+        )
+
+        overlap = abs(
+            np.dot(v0, u_sym)
+        )
+
+        print(
+            f"{i:3d}  "
+            f"E = {E_dav[i]:18.12f}  "
+            f"residual = {resnorm:12.5e}  "
+            f"|<v0|U_sym>|^2 = {overlap**2:12.5e}"
+        )
+
+
+# ============================================================
+# Run
+# ============================================================
+
+if __name__ == "__main__":
+    main()
+
+
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='node04', release='6.8.0-110-generic', version='#110-Ubuntu SMP PREEMPT_DYNAMIC Thu Mar 19 15:09:20 UTC 2026', machine='x86_64')  Threads 8
+Python 3.14.7 | packaged by Anaconda, Inc. | (main, Aug 14 2026, 10:21:40) [GCC 14.3.0]
+numpy 2.5.2  scipy 1.18.1  h5py 3.16.0
+Date: Mon Sep 28 19:14:24 2026
+PySCF version 2.14.0
+PySCF path  /home/evgeniy/prog/pyscf
+GIT ORIG_HEAD 34e5aa023afaf42157932b2b0e35e716f7af0b14
+GIT HEAD (branch master) e47d1279f72ffd50cbad43fbfed50511d8415b7e
+
+[ENV] PYSCF_TMPDIR /scratch/evgeniy/pyscf-test
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 3
+[INPUT] num. electrons = 10
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 0
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+[INPUT]  1 O      0.000000000000   0.000000000000   0.000000000000 AA    0.000000000000   0.000000000000   0.000000000000 Bohr   0.0
+[INPUT]  2 H      0.000000000000  -0.757000000000   0.587000000000 AA    0.000000000000  -1.430522676296   1.109269235120 Bohr   0.0
+[INPUT]  3 H      0.000000000000   0.757000000000   0.587000000000 AA    0.000000000000   1.430522676296   1.109269235120 Bohr   0.0
+
+nuclear repulsion = 9.18825841774611
+number of shells = 11
+number of NR pGTOs = 40
+number of NR cGTOs = 24
+basis = cc-pvdz
+ecp = {}
+CPU time:         0.65
+
+
+******** <class 'pyscf.scf.hf.RHF'> ********
+method = RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /scratch/evgeniy/pyscf-test/tmp8iy3eryr
+max_memory 4000 MB (current use 128 MB)
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -75.8564886162471
+  HOMO = -0.476818251418631  LUMO = 0.100626554688233  gap/eV = 15.71307
+cycle= 1 E= -75.9878157199692  delta_E= -0.131  |g|= 0.448  |ddm|= 1.31
+  HOMO = -0.412638622054454  LUMO = 0.186492856349361  gap/eV = 16.30320
+cycle= 2 E= -76.0177142185363  delta_E= -0.0299  |g|= 0.228  |ddm|= 0.37
+  HOMO = -0.498200382859052  LUMO = 0.180827609256027  gap/eV = 18.47729
+cycle= 3 E= -76.0265825515462  delta_E= -0.00887  |g|= 0.0245  |ddm|= 0.13
+  HOMO = -0.491201369420481  LUMO = 0.185596353732397  gap/eV = 18.41660
+cycle= 4 E= -76.0267512314625  delta_E= -0.000169  |g|= 0.00587  |ddm|= 0.0181
+  HOMO = -0.492724703264151  LUMO = 0.185526872973989  gap/eV = 18.45617
+cycle= 5 E= -76.0267651795247  delta_E= -1.39e-05  |g|= 0.000977  |ddm|= 0.00645
+  HOMO = -0.493079624821709  LUMO = 0.185443933895617  gap/eV = 18.46357
+cycle= 6 E= -76.0267656607417  delta_E= -4.81e-07  |g|= 0.00015  |ddm|= 0.00138
+  HOMO = -0.493134919327476  LUMO = 0.185437522619828  gap/eV = 18.46490
+cycle= 7 E= -76.0267656729543  delta_E= -1.22e-08  |g|= 1.64e-05  |ddm|= 0.000264
+  HOMO = -0.493133773976806  LUMO = 0.185436743480246  gap/eV = 18.46484
+cycle= 8 E= -76.0267656731085  delta_E= -1.54e-10  |g|= 3.88e-06  |ddm|= 2.65e-05
+  HOMO = -0.493132772871712  LUMO = 0.185436779986023  gap/eV = 18.46482
+Extra cycle  E= -76.0267656731175  delta_E= -8.95e-12  |g|= 1.69e-06  |ddm|= 5.44e-06
+converged SCF energy = -76.0267656731175
+
+******** <class 'pyscf.adc.radc.RADC'> ********
+max_memory 4000 MB (current use 136 MB)
+******** ADC Orbital Information ********
+Number of Frozen Occupied Orbitals: 0
+Number of Frozen Virtual Orbitals: 0
+Number of Active Occupied Orbitals: 5
+Number of Active Virtual Orbitals: 19
+*****************************************
+Reference correlation energy (doubles): -0.20401998
+MP2 correlation energy of reference state (a.u.) = -0.20401998
+
+========================================
+IP-ADC dimensions
+========================================
+nocc             = 5
+nvir             = 19
+1h dimension     = 5
+2h1p dimension   = 475
+total dimension  = 480
+
+========================================
+Metric transformation test
+========================================
+||sqrt(S) invsqrt(S) x - x|| / ||x|| = 1.1628675355997059e-16
+
+========================================
+Symmetry test for transformed matvec
+========================================
+  0  x^T A_sym y =  -3.794507432453e-01  (A_sym x)^T y =  -3.794507432453e-01  diff =  2.22045e-16
+  1  x^T A_sym y =  -2.947996855787e-01  (A_sym x)^T y =  -2.947996855787e-01  diff =  5.55112e-17
+  2  x^T A_sym y =   9.130870472314e-02  (A_sym x)^T y =   9.130870472314e-02  diff =  4.44089e-16
+  3  x^T A_sym y =  -5.556280306161e-01  (A_sym x)^T y =  -5.556280306161e-01  diff =  4.44089e-16
+  4  x^T A_sym y =   3.016716246814e-01  (A_sym x)^T y =   3.016716246814e-01  diff = -7.21645e-16
+  5  x^T A_sym y =   1.728008057426e+00  (A_sym x)^T y =   1.728008057426e+00  diff =  0.00000e+00
+  6  x^T A_sym y =  -1.064177685973e+00  (A_sym x)^T y =  -1.064177685973e+00  diff =  0.00000e+00
+  7  x^T A_sym y =  -6.864362159573e-01  (A_sym x)^T y =  -6.864362159573e-01  diff =  0.00000e+00
+  8  x^T A_sym y =   4.961745826128e-01  (A_sym x)^T y =   4.961745826128e-01  diff =  1.11022e-16
+  9  x^T A_sym y =  -5.984770136678e-01  (A_sym x)^T y =  -5.984770136678e-01  diff = -1.11022e-16
+
+Maximum symmetry error = 7.216449660063518e-16
+
+========================================
+Lanczos initial vector
+========================================
+Initial-vector index = 4
+Corresponding diagonal element = 0.5471442110955631
+
+========================================
+Starting symmetric Lanczos
+========================================
+Iteration    1: alpha =     0.547144211096   beta =  5.36120e-01
+Iteration    2: alpha =     3.444015110100   beta =  4.22325e+00
+Iteration    3: alpha =    29.584787932710   beta =  1.18929e+01
+Iteration    4: alpha =    24.776198144301   beta =  1.28119e+01
+Iteration    5: alpha =    14.685463531601   beta =  2.30008e+00
+Iteration    6: alpha =    12.909126271896   beta =  1.01136e+01
+Iteration    7: alpha =    13.961888483450   beta =  3.43521e+00
+Iteration    8: alpha =    29.097464082453   beta =  1.72258e+01
+Iteration    9: alpha =    19.134144905876   beta =  8.72884e+00
+Iteration   10: alpha =    21.211411274634   beta =  4.31492e+00
+Iteration   11: alpha =    29.356297828288   beta =  1.79137e+01
+Iteration   12: alpha =    18.263276432661   beta =  5.30686e+00
+Iteration   13: alpha =    20.865738915015   beta =  5.87657e+00
+Iteration   14: alpha =     5.985817023138   beta =  4.00503e+00
+Iteration   15: alpha =    20.509028366242   beta =  5.76322e+00
+Iteration   16: alpha =     5.542008026350   beta =  2.87455e+00
+Iteration   17: alpha =    18.869218340628   beta =  7.96313e+00
+Iteration   18: alpha =     7.593650234086   beta =  2.34572e+00
+Iteration   19: alpha =    18.971941997177   beta =  8.40667e+00
+Iteration   20: alpha =     9.009579312776   beta =  2.57124e+00
+Iteration   21: alpha =    16.326817355786   beta =  9.21497e+00
+Iteration   22: alpha =    10.665082486175   beta =  1.46489e+00
+Iteration   23: alpha =    12.626307267487   beta =  9.97886e+00
+Iteration   24: alpha =    14.927981606006   beta =  1.95716e+00
+Iteration   25: alpha =    10.314080321380   beta =  8.93779e+00
+Iteration   26: alpha =    16.969662361227   beta =  2.85397e+00
+Iteration   27: alpha =    34.619726736578   beta =  1.78048e+01
+Iteration   28: alpha =    14.106241255608   beta =  3.03134e+00
+Iteration   29: alpha =    20.502911903623   beta =  6.14630e+00
+Iteration   30: alpha =     9.071142536487   beta =  1.05278e+01
+Iteration   31: alpha =    38.816745175435   beta =  4.37879e+00
+Iteration   32: alpha =     9.944739258692   beta =  1.14300e+01
+Iteration   33: alpha =    28.391704842689   beta =  1.01767e+01
+Iteration   34: alpha =    30.822310461934   beta =  4.54139e+00
+Iteration   35: alpha =     5.996707348343   beta =  5.82249e+00
+Iteration   36: alpha =    26.496475289494   beta =  9.84917e+00
+Iteration   37: alpha =    35.541879383507   beta =  9.80546e+00
+Iteration   38: alpha =     8.282566164242   beta =  6.21252e+00
+Iteration   39: alpha =    40.632651433848   beta =  5.59934e+00
+Iteration   40: alpha =    11.472270113372   beta =  9.51053e+00
+Iteration   41: alpha =    16.337896774578   beta =  3.89512e+00
+Iteration   42: alpha =    38.822250531974   beta =  1.19316e+01
+Iteration   43: alpha =     8.489641398080   beta =  4.86289e+00
+Iteration   44: alpha =    29.726687851325   beta =  1.19564e+01
+Iteration   45: alpha =    26.914611505653   beta =  1.27415e+01
+Iteration   46: alpha =    13.256032534527   beta =  1.35785e+00
+Iteration   47: alpha =    24.216092762301   beta =  1.93402e+01
+Iteration   48: alpha =    22.372117316595   beta =  3.52074e+00
+Iteration   49: alpha =    22.355225569323   beta =  7.56135e+00
+Iteration   50: alpha =    21.668628089598   beta =  1.87870e+01
+Iteration   51: alpha =    25.285971216086   beta =  2.21051e+00
+Iteration   52: alpha =    30.807852319825   beta =  1.76181e+01
+Iteration   53: alpha =    15.187177269994   beta =  1.15384e+00
+Iteration   54: alpha =    29.907766042223   beta =  1.83405e+01
+Iteration   55: alpha =    15.680611410165   beta =  6.01616e-01
+Iteration   56: alpha =    18.566586679081   beta =  1.93139e+01
+Iteration   57: alpha =    27.644914359901   beta =  2.25332e+00
+Iteration   58: alpha =    22.497187666043   beta =  1.27249e+01
+Iteration   59: alpha =    19.233155010923   beta =  1.33595e+01
+Iteration   60: alpha =    30.658025746675   beta =  1.49687e+00
+Iteration   61: alpha =     8.252122244931   beta =  1.13058e+01
+Iteration   62: alpha =    34.886235393755   beta =  9.34818e+00
+Iteration   63: alpha =    22.424359507369   beta =  3.54922e+00
+Iteration   64: alpha =     4.183508563688   beta =  3.66483e+00
+Iteration   65: alpha =    36.577108299482   beta =  1.36168e+01
+Iteration   66: alpha =     8.291260263883   beta =  2.17045e+00
+Iteration   67: alpha =    10.441354060762   beta =  1.16276e+01
+Iteration   68: alpha =    22.931386823834   beta =  8.73305e+00
+Iteration   69: alpha =    36.490871739577   beta =  5.99667e+00
+Iteration   70: alpha =     4.942841838449   beta =  1.27116e+00
+Iteration   71: alpha =    14.366973305037   beta =  9.31984e+00
+Iteration   72: alpha =    11.713890535881   beta =  2.85519e+00
+Iteration   73: alpha =    22.965949464381   beta =  3.99541e+00
+Iteration   74: alpha =     5.728243019234   beta =  1.85341e+00
+Iteration   75: alpha =     5.785650437682   beta =  5.30025e+00
+Iteration   76: alpha =    18.705090904223   beta =  6.68648e+00
+Iteration   77: alpha =     6.493321856527   beta =  5.68804e+00
+Iteration   78: alpha =    20.662483217248   beta =  5.06353e+00
+Iteration   79: alpha =     4.878604420971   beta =  1.03792e+00
+Iteration   80: alpha =    21.339369364967   beta =  7.70520e+00
+Iteration   81: alpha =     7.325862415447   beta =  3.49876e+00
+Iteration   82: alpha =    21.376555244828   beta =  2.61203e+00
+Iteration   83: alpha =     6.488880830034   beta =  7.39078e+00
+Iteration   84: alpha =    21.304361618718   beta =  1.67487e+00
+Iteration   85: alpha =    14.308123884368   beta =  9.80951e+00
+Iteration   86: alpha =    14.733535189827   beta =  2.20667e+00
+Iteration   87: alpha =    14.563550533742   beta =  8.58040e+00
+Iteration   88: alpha =    13.614529049584   beta =  2.42951e+00
+Iteration   89: alpha =    13.413817005464   beta =  1.05098e+01
+Iteration   90: alpha =    14.912332977567   beta =  1.37607e+00
+Iteration   91: alpha =    18.547588712236   beta =  9.86713e+00
+Iteration   92: alpha =     7.808738268483   beta =  2.18226e+00
+Iteration   93: alpha =    18.123941025355   beta =  7.53819e+00
+Iteration   94: alpha =     6.484772826659   beta =  1.70128e+00
+Iteration   95: alpha =    22.637692876457   beta =  5.67848e+00
+Iteration   96: alpha =     5.651936407819   beta =  2.95316e+00
+Iteration   97: alpha =    16.567883827169   beta =  8.48945e+00
+Iteration   98: alpha =     9.624586462039   beta =  2.47961e+00
+Iteration   99: alpha =     9.088290085433   beta =  9.23455e+00
+Iteration  100: alpha =    17.893809627562   beta =  1.34788e+00
+
+========================================
+Lowest Lanczos Ritz values
+========================================
+  0      0.403385993748 Eh      10.97669208 eV
+  1      0.490910435616 Eh      13.35835348 eV
+  2      0.657036088065 Eh      17.87886277 eV
+  3      1.167774563091 Eh      31.77676468 eV
+  4      1.250815004687 Eh      34.03641021 eV
+  5      1.354509829710 Eh      36.85809015 eV
+  6      1.471480452037 Eh      40.04102293 eV
+  7      1.918427081532 Eh      52.20306030 eV
+  8      1.983614565450 Eh      53.97690210 eV
+  9      2.024014910383 Eh      55.07625149 eV
+
+========================================
+Lanczos orthogonality
+========================================
+||Q^T Q - I|| = 7.072197324710408e-15
+
+========================================
+Lanczos Ritz residuals
+========================================
+  0  E =     0.403385993748  residual =  1.20981e-15
+  1  E =     0.490910435616  residual =  2.48916e-07
+  2  E =     0.657036088065  residual =  1.28140e-08
+  3  E =     1.167774563091  residual =  1.55581e-01
+  4  E =     1.250815004687  residual =  1.54053e-14
+  5  E =     1.354509829710  residual =  3.59462e-01
+  6  E =     1.471480452037  residual =  2.79900e-14
+  7  E =     1.918427081532  residual =  3.27484e-09
+  8  E =     1.983614565450  residual =  5.99809e-08
+  9  E =     2.024014910383  residual =  6.68581e-08
+
+========================================
+PySCF Davidson reference
+========================================
+
+******** <class 'pyscf.adc.radc_ip.RADCIP'> ********
+max_space = 12
+max_cycle = 50
+conv_tol = 1e-08
+max_memory 4000 MB (current use 156 MB)
+
+*************************************************************
+        ADC calculation summary (doublet states only)
+*************************************************************
+adc(2) root 0  |  Energy (Eh) =   0.4033859937  |  Energy (eV) =  10.97669199  |  Spec. factor = 1.81611862  |  conv = True
+adc(2) root 1  |  Energy (Eh) =   0.4909104356  |  Energy (eV) =  13.35835336  |  Spec. factor = 1.82734004  |  conv = True
+adc(2) root 2  |  Energy (Eh) =   0.6570360881  |  Energy (eV) =  17.87886262  |  Spec. factor = 1.85818550  |  conv = True
+adc(2) root 3  |  Energy (Eh) =   1.1589258846  |  Energy (eV) =  31.53597962  |  Spec. factor = 0.50027584  |  conv = True
+adc(2) root 4  |  Energy (Eh) =   1.2043287786  |  Energy (eV) =  32.77145529  |  Spec. factor = 1.27096110  |  conv = True
+adc(2) root 5  |  Energy (Eh) =   1.2425999784  |  Energy (eV) =  33.81286768  |  Spec. factor = 0.00055725  |  conv = True
+adc(2) root 6  |  Energy (Eh) =   1.2452122465  |  Energy (eV) =  33.88395112  |  Spec. factor = 0.00002486  |  conv = True
+adc(2) root 7  |  Energy (Eh) =   1.2508150039  |  Energy (eV) =  34.03640991  |  Spec. factor = 0.01079072  |  conv = True
+adc(2) root 8  |  Energy (Eh) =   1.3159405863  |  Energy (eV) =  35.80856727  |  Spec. factor = 0.00008930  |  conv = True
+adc(2) root 9  |  Energy (Eh) =   1.3159405863  |  Energy (eV) =  35.80856727  |  Spec. factor = 0.00000822  |  conv = True
+
+========================================
+Davidson vs Lanczos
+========================================
+ root        Davidson / Eh         Lanczos / Eh      difference / Eh       residual
+    0       0.403385993748       0.403385993748         5.551115e-16    1.20981e-15
+    1       0.490910435616       0.490910435616         3.383405e-13    2.48916e-07
+    2       0.657036088064       0.657036088065         4.650724e-13    1.28140e-08
+    3       1.158925884621       1.167774563091         8.848678e-03    1.55581e-01
+    4       1.204328778586       1.250815004687         4.648623e-02    1.54053e-14
+    5       1.242599978352       1.354509829710         1.119099e-01    3.59462e-01
+    6       1.245212246475       1.471480452037         2.262682e-01    2.79900e-14
+    7       1.250815003936       1.918427081532         6.676121e-01    3.27484e-09
+    8       1.315940586347       1.983614565450         6.676740e-01    5.99809e-08
+    9       1.315940586347       2.024014910383         7.080743e-01    6.68581e-08
+
+========================================
+Transformed Davidson eigenvector test
+========================================
+  0  E =     0.403385993748  residual =  1.36725e-14  |<v0|U_sym>|^2 =  9.19172e-01
+  1  E =     0.490910435616  residual =  3.69320e-10  |<v0|U_sym>|^2 =  4.66493e-32
+  2  E =     0.657036088064  residual =  1.34177e-10  |<v0|U_sym>|^2 =  6.52813e-29
+  3  E =     1.158925884621  residual =  2.91562e-08  |<v0|U_sym>|^2 =  5.34092e-31
+  4  E =     1.204328778586  residual =  1.17930e-07  |<v0|U_sym>|^2 =  9.36601e-32
+  5  E =     1.242599978352  residual =  7.44458e-06  |<v0|U_sym>|^2 =  2.94321e-30
+  6  E =     1.245212246475  residual =  6.77135e-15  |<v0|U_sym>|^2 =  4.95431e-28
+  7  E =     1.250815003936  residual =  2.01613e-06  |<v0|U_sym>|^2 =  5.34387e-03
+  8  E =     1.315940586347  residual =  3.15469e-15  |<v0|U_sym>|^2 =  1.47536e-30
+  9  E =     1.315940586347  residual =  1.93169e-15  |<v0|U_sym>|^2 =  5.27912e-31
+The job finished:  Mon Sep 28 19:14:25 CEST 2026

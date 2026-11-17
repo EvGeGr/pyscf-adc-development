@@ -37,6 +37,7 @@ from pyscf.adc import uadc_ip_cvs
 from pyscf.adc import uadc_ea
 from pyscf.adc import uadc_ee
 
+from pyscf.adc.ee_adc2_memory import estimate_ee_adc2_memory
 
 def ADC(mf, frozen=None, mo_coeff=None, mo_occ=None):
 

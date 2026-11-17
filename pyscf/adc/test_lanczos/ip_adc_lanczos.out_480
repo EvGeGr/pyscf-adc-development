@@ -1,0 +1,931 @@
+#INFO: **** input file is /home/evgeniy/prog/pyscf/pyscf/adc/test_lanczos/ip_adc_lanczos.py ****
+import numpy as np
+
+from pyscf import gto, scf, adc
+from pyscf.adc import radc_ip
+
+
+# ============================================================
+# Symmetric Lanczos with full reorthogonalization
+# ============================================================
+
+def lanczos(matvec, v0, maxiter=100, tol=1.0e-12):
+    """
+    Standard symmetric Lanczos algorithm.
+
+    Parameters
+    ----------
+    matvec : callable
+        Function returning A @ x.
+    v0 : ndarray
+        Initial vector.
+    maxiter : int
+        Maximum Krylov dimension.
+    tol : float
+        Breakdown threshold.
+
+    Returns
+    -------
+    alpha : ndarray
+        Diagonal elements of the Lanczos matrix.
+    beta : ndarray
+        Off-diagonal elements of the Lanczos matrix.
+    Q : ndarray
+        Lanczos basis vectors as columns.
+    """
+
+    q = np.asarray(v0, dtype=float).copy()
+
+    norm = np.linalg.norm(q)
+    if norm < tol:
+        raise ValueError("Initial Lanczos vector has zero norm.")
+
+    q /= norm
+
+    n = q.size
+
+    Q = np.zeros((n, maxiter), dtype=float)
+    alpha = np.zeros(maxiter, dtype=float)
+    beta = np.zeros(maxiter - 1, dtype=float)
+
+    q_prev = np.zeros_like(q)
+    beta_prev = 0.0
+
+    m = 0
+
+    for j in range(maxiter):
+
+        Q[:, j] = q
+
+        # Matrix-vector product
+        z = matvec(q)
+
+        # alpha_j = q_j^T A q_j
+        alpha[j] = np.dot(q, z)
+
+        # Three-term Lanczos recurrence
+        z -= alpha[j] * q
+
+        if j > 0:
+            z -= beta_prev * q_prev
+
+        # ----------------------------------------------------
+        # Full reorthogonalization
+        # ----------------------------------------------------
+        # This is intentionally used for the first implementation.
+        # It makes the numerical comparison with Davidson cleaner.
+        #
+        # Two passes improve numerical orthogonality.
+        # ----------------------------------------------------
+
+        Qj = Q[:, :j+1]
+
+        for _ in range(2):
+            coeff = Qj.T @ z
+            z -= Qj @ coeff
+
+        b = np.linalg.norm(z)
+
+        m = j + 1
+
+        print(
+            f"Iteration {j+1:4d}: "
+            f"alpha = {alpha[j]:18.12f}   "
+            f"beta = {b:12.5e}"
+        )
+
+        if b < tol:
+            print("\nLanczos breakdown/convergence.")
+            break
+
+        if j == maxiter - 1:
+            break
+
+        beta[j] = b
+
+        q_prev = q.copy()
+        q = z / b
+        beta_prev = b
+
+    alpha = alpha[:m]
+
+    if m > 1:
+        beta = beta[:m-1]
+    else:
+        beta = np.empty(0)
+
+    Q = Q[:, :m]
+
+    return alpha, beta, Q
+
+
+# ============================================================
+# Construct tridiagonal Lanczos matrix
+# ============================================================
+
+def make_tridiagonal(alpha, beta):
+
+    m = len(alpha)
+
+    T = np.diag(alpha)
+
+    if m > 1:
+        idx = np.arange(m - 1)
+
+        T[idx, idx + 1] = beta
+        T[idx + 1, idx] = beta
+
+    return T
+
+
+# ============================================================
+# Test system
+# ============================================================
+
+mol = gto.M(
+    atom="""
+    O   0.000000   0.000000   0.000000
+    H   0.000000  -0.757000   0.587000
+    H   0.000000   0.757000   0.587000
+    """,
+    basis="cc-pvdz",
+    verbose=4,
+)
+
+mf = scf.RHF(mol)
+mf.kernel()
+
+
+# ============================================================
+# ADC ground-state calculation
+# ============================================================
+
+myadc = adc.ADC(mf)
+
+myadc.method = "adc(2)"
+myadc.method_type = "ip"
+
+myadc.kernel_gs()
+
+
+# ============================================================
+# Construct IP-ADC object
+# ============================================================
+
+myadcip = radc_ip.RADCIP(myadc)
+
+
+# ============================================================
+# Build integrals and IP-ADC matrix-vector function
+#
+# This follows exactly the beginning of radc.kernel():
+#
+#     eris = adc.transform_integrals()
+#     imds = adc.get_imds(eris)
+#     matvec, diag = adc.gen_matvec(imds, eris)
+#
+# ============================================================
+
+eris = myadcip.transform_integrals()
+
+imds = myadcip.get_imds(eris)
+
+matvec, diag = myadcip.gen_matvec(imds, eris)
+
+
+dim = len(diag)
+
+print()
+print("========================================")
+print("IP-ADC matrix dimension =", dim)
+print("========================================")
+print()
+
+
+# ============================================================
+# Initial Lanczos vector
+#
+# For this numerical test use the basis vector corresponding
+# to the smallest diagonal matrix element.
+# ============================================================
+
+i0 = np.argmin(diag)
+
+v0 = np.zeros(dim)
+v0[i0] = 1.0
+
+print("Initial vector index:", i0)
+print("Initial diagonal element:", diag[i0])
+
+
+# ============================================================
+# Lanczos
+# ============================================================
+
+maxiter = min(100, dim)
+
+alpha, beta, Q = lanczos(
+    matvec,
+    v0,
+    maxiter=dim,
+    tol=1.0e-14,
+)
+
+T = make_tridiagonal(alpha, beta)
+
+ritz_values, ritz_vectors = np.linalg.eigh(T)
+
+
+print()
+print("========================================")
+print("Lowest Lanczos Ritz values")
+print("========================================")
+
+for i, e in enumerate(ritz_values[:10]):
+    print(f"{i:3d}   {e:18.12f} Eh   {e * 27.211386245988:14.8f} eV")
+
+
+# ============================================================
+# Check orthogonality of Lanczos basis
+# ============================================================
+
+orth_error = np.linalg.norm(
+    Q.T @ Q - np.eye(Q.shape[1])
+)
+
+print()
+print("Lanczos basis orthogonality error:")
+print(orth_error)
+
+
+# ============================================================
+# Davidson reference
+#
+# Use exactly the same IP-ADC object.
+# ============================================================
+
+print()
+print("========================================")
+print("PySCF Davidson reference")
+print("========================================")
+
+nroots = min(10, dim)
+
+E_dav, U_dav, P_dav, X_dav = myadcip.kernel(
+    nroots=nroots,
+    eris=eris,
+)
+
+
+print()
+print("========================================")
+print("Davidson vs Lanczos")
+print("========================================")
+
+print(
+    f"{'root':>5s} "
+    f"{'Davidson / Eh':>20s} "
+    f"{'Lanczos / Eh':>20s} "
+    f"{'difference':>16s}"
+)
+
+for i in range(min(nroots, len(ritz_values))):
+
+    diff = ritz_values[i] - E_dav[i]
+
+    print(
+        f"{i:5d} "
+        f"{E_dav[i]:20.12f} "
+        f"{ritz_values[i]:20.12f} "
+        f"{diff:16.6e}"
+    )
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='node04', release='6.8.0-110-generic', version='#110-Ubuntu SMP PREEMPT_DYNAMIC Thu Mar 19 15:09:20 UTC 2026', machine='x86_64')  Threads 8
+Python 3.14.7 | packaged by Anaconda, Inc. | (main, Aug 14 2026, 10:21:40) [GCC 14.3.0]
+numpy 2.5.2  scipy 1.18.1  h5py 3.16.0
+Date: Mon Sep 28 18:29:20 2026
+PySCF version 2.14.0
+PySCF path  /home/evgeniy/prog/pyscf
+GIT ORIG_HEAD 34e5aa023afaf42157932b2b0e35e716f7af0b14
+GIT HEAD (branch master) e47d1279f72ffd50cbad43fbfed50511d8415b7e
+
+[ENV] PYSCF_TMPDIR /scratch/evgeniy/pyscf-test
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 3
+[INPUT] num. electrons = 10
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 0
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+[INPUT]  1 O      0.000000000000   0.000000000000   0.000000000000 AA    0.000000000000   0.000000000000   0.000000000000 Bohr   0.0
+[INPUT]  2 H      0.000000000000  -0.757000000000   0.587000000000 AA    0.000000000000  -1.430522676296   1.109269235120 Bohr   0.0
+[INPUT]  3 H      0.000000000000   0.757000000000   0.587000000000 AA    0.000000000000   1.430522676296   1.109269235120 Bohr   0.0
+
+nuclear repulsion = 9.18825841774611
+number of shells = 11
+number of NR pGTOs = 40
+number of NR cGTOs = 24
+basis = cc-pvdz
+ecp = {}
+CPU time:         0.65
+
+
+******** <class 'pyscf.scf.hf.RHF'> ********
+method = RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /scratch/evgeniy/pyscf-test/tmprb7g4ep1
+max_memory 4000 MB (current use 127 MB)
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -75.8564886162471
+  HOMO = -0.476818251418632  LUMO = 0.100626554688235  gap/eV = 15.71307
+cycle= 1 E= -75.9878157199693  delta_E= -0.131  |g|= 0.448  |ddm|= 1.31
+  HOMO = -0.412638622054455  LUMO = 0.186492856349355  gap/eV = 16.30320
+cycle= 2 E= -76.0177142185364  delta_E= -0.0299  |g|= 0.228  |ddm|= 0.37
+  HOMO = -0.498200382859048  LUMO = 0.180827609256027  gap/eV = 18.47729
+cycle= 3 E= -76.0265825515463  delta_E= -0.00887  |g|= 0.0245  |ddm|= 0.13
+  HOMO = -0.491201369420486  LUMO = 0.1855963537324  gap/eV = 18.41660
+cycle= 4 E= -76.0267512314626  delta_E= -0.000169  |g|= 0.00587  |ddm|= 0.0181
+  HOMO = -0.492724703264158  LUMO = 0.185526872973996  gap/eV = 18.45617
+cycle= 5 E= -76.0267651795248  delta_E= -1.39e-05  |g|= 0.000977  |ddm|= 0.00645
+  HOMO = -0.49307962482171  LUMO = 0.185443933895618  gap/eV = 18.46357
+cycle= 6 E= -76.0267656607417  delta_E= -4.81e-07  |g|= 0.00015  |ddm|= 0.00138
+  HOMO = -0.493134919327485  LUMO = 0.185437522619829  gap/eV = 18.46490
+cycle= 7 E= -76.0267656729544  delta_E= -1.22e-08  |g|= 1.64e-05  |ddm|= 0.000264
+  HOMO = -0.493133773976756  LUMO = 0.185436743480235  gap/eV = 18.46484
+cycle= 8 E= -76.0267656731084  delta_E= -1.54e-10  |g|= 3.88e-06  |ddm|= 2.65e-05
+  HOMO = -0.493132772871721  LUMO = 0.185436779986013  gap/eV = 18.46482
+Extra cycle  E= -76.0267656731176  delta_E= -9.15e-12  |g|= 1.69e-06  |ddm|= 5.44e-06
+converged SCF energy = -76.0267656731176
+
+******** <class 'pyscf.adc.radc.RADC'> ********
+max_memory 4000 MB (current use 135 MB)
+******** ADC Orbital Information ********
+Number of Frozen Occupied Orbitals: 0
+Number of Frozen Virtual Orbitals: 0
+Number of Active Occupied Orbitals: 5
+Number of Active Virtual Orbitals: 19
+*****************************************
+Reference correlation energy (doubles): -0.20401998
+MP2 correlation energy of reference state (a.u.) = -0.20401998
+
+========================================
+IP-ADC matrix dimension = 480
+========================================
+
+Initial vector index: 4
+Initial diagonal element: 0.5471442110955732
+Iteration    1: alpha =     0.547144211096   beta =  4.42217e-01
+Iteration    2: alpha =     3.593119815755   beta =  4.58868e+00
+Iteration    3: alpha =    31.656039600929   beta =  1.19121e+01
+Iteration    4: alpha =    23.073784988087   beta =  1.19999e+01
+Iteration    5: alpha =    14.344768965173   beta =  2.12067e+00
+Iteration    6: alpha =    12.583584414786   beta =  1.02380e+01
+Iteration    7: alpha =    14.519161055992   beta =  3.95186e+00
+Iteration    8: alpha =    32.081332082160   beta =  1.65737e+01
+Iteration    9: alpha =    16.030701338658   beta =  7.39667e+00
+Iteration   10: alpha =    21.487919661942   beta =  5.47837e+00
+Iteration   11: alpha =    31.228085812791   beta =  1.70873e+01
+Iteration   12: alpha =    16.006804576943   beta =  4.39757e+00
+Iteration   13: alpha =    20.647441036937   beta =  6.34054e+00
+Iteration   14: alpha =     6.339418436071   beta =  3.74413e+00
+Iteration   15: alpha =    19.814108698663   beta =  6.50404e+00
+Iteration   16: alpha =     6.061788744085   beta =  2.49716e+00
+Iteration   17: alpha =    17.850087392973   beta =  8.79353e+00
+Iteration   18: alpha =     8.720920169761   beta =  2.29382e+00
+Iteration   19: alpha =    17.731387479999   beta =  8.95705e+00
+Iteration   20: alpha =    10.257641183835   beta =  2.38986e+00
+Iteration   21: alpha =    15.103405005878   beta =  9.59399e+00
+Iteration   22: alpha =    11.686750204570   beta =  1.49555e+00
+Iteration   23: alpha =    11.572269628444   beta =  9.73078e+00
+Iteration   24: alpha =    16.131345946471   beta =  1.97389e+00
+Iteration   25: alpha =     8.974250116318   beta =  8.36063e+00
+Iteration   26: alpha =    18.000494907493   beta =  1.81261e+00
+Iteration   27: alpha =    15.117819165900   beta =  1.83629e+01
+Iteration   28: alpha =    33.327465846550   beta =  4.04659e+00
+Iteration   29: alpha =    19.454189225613   beta =  7.35263e+00
+Iteration   30: alpha =     7.691789246980   beta =  4.17233e+00
+Iteration   31: alpha =    39.030909088515   beta =  1.04970e+01
+Iteration   32: alpha =    10.441793560403   beta =  8.53611e+00
+Iteration   33: alpha =    21.903444851134   beta =  5.54097e+00
+Iteration   34: alpha =    35.942500502948   beta =  1.24908e+01
+Iteration   35: alpha =     9.851510828641   beta =  5.44852e+00
+Iteration   36: alpha =    27.922572375880   beta =  1.04780e+01
+Iteration   37: alpha =    33.871274800209   beta =  1.02773e+01
+Iteration   38: alpha =     8.534915030599   beta =  4.95571e+00
+Iteration   39: alpha =    40.390626840771   beta =  6.47012e+00
+Iteration   40: alpha =     9.913032825700   beta =  8.85819e+00
+Iteration   41: alpha =    18.630853338962   beta =  5.06804e+00
+Iteration   42: alpha =    40.018907188736   beta =  1.05213e+01
+Iteration   43: alpha =     7.285387537001   beta =  4.49923e+00
+Iteration   44: alpha =    32.412112827425   beta =  1.21527e+01
+Iteration   45: alpha =    21.722476004449   beta =  1.18108e+01
+Iteration   46: alpha =    15.066261245255   beta =  1.80497e+00
+Iteration   47: alpha =    29.951011665186   beta =  1.86584e+01
+Iteration   48: alpha =    17.283677703394   beta =  3.24973e+00
+Iteration   49: alpha =    26.735522712360   beta =  1.13603e+01
+Iteration   50: alpha =    27.635773727256   beta =  1.48719e+01
+Iteration   51: alpha =    14.570543466967   beta =  2.21811e+00
+Iteration   52: alpha =    33.399719454565   beta =  1.58014e+01
+Iteration   53: alpha =    12.020290726870   beta =  1.15445e+00
+Iteration   54: alpha =    32.269173068899   beta =  1.73137e+01
+Iteration   55: alpha =    13.409133706274   beta =  7.41752e-01
+Iteration   56: alpha =    28.633664964744   beta =  1.89800e+01
+Iteration   57: alpha =    17.541577567544   beta =  1.61178e+00
+Iteration   58: alpha =    27.153552808298   beta =  1.85912e+01
+Iteration   59: alpha =    19.362875736298   beta =  4.16119e+00
+Iteration   60: alpha =    25.511606722085   beta =  3.56999e+00
+Iteration   61: alpha =     7.772124177743   beta =  1.13227e+01
+Iteration   62: alpha =    37.934010191585   beta =  4.03688e+00
+Iteration   63: alpha =    16.372129571939   beta =  7.42397e+00
+Iteration   64: alpha =    10.247502973686   beta =  9.13274e+00
+Iteration   65: alpha =    39.652601421871   beta =  4.37100e+00
+Iteration   66: alpha =     4.829156978664   beta =  2.16039e+00
+Iteration   67: alpha =    23.105166891480   beta =  9.52381e+00
+Iteration   68: alpha =    14.936392100537   beta =  1.44558e+01
+Iteration   69: alpha =    33.162446763194   beta =  3.28826e+00
+Iteration   70: alpha =     2.619151948491   beta =  2.11410e+00
+Iteration   71: alpha =    12.424752790343   beta =  9.36879e+00
+Iteration   72: alpha =    11.535355026465   beta =  1.36999e+00
+Iteration   73: alpha =    21.340247013391   beta =  8.21177e+00
+Iteration   74: alpha =     7.078754717348   beta =  1.60811e+00
+Iteration   75: alpha =     2.559038261081   beta =  3.31902e+00
+Iteration   76: alpha =    21.277300515387   beta =  7.86067e+00
+Iteration   77: alpha =     6.789585742960   beta =  2.22630e+00
+Iteration   78: alpha =    15.000607519571   beta =  7.70107e+00
+Iteration   79: alpha =    12.669094929614   beta =  1.57116e+00
+Iteration   80: alpha =    13.473206668461   beta =  1.06814e+01
+Iteration   81: alpha =    15.065424885854   beta =  1.41259e+00
+Iteration   82: alpha =    17.643256042158   beta =  8.41345e+00
+Iteration   83: alpha =     8.593068925275   beta =  2.95969e+00
+Iteration   84: alpha =    23.477727953485   beta =  3.77760e+00
+Iteration   85: alpha =     6.042165694830   beta =  3.86555e+00
+Iteration   86: alpha =    21.790147351965   beta =  4.86478e+00
+Iteration   87: alpha =     7.919785562076   beta =  4.22210e+00
+Iteration   88: alpha =    20.460886780346   beta =  5.75377e+00
+Iteration   89: alpha =     6.927427524677   beta =  5.75495e+00
+Iteration   90: alpha =    22.007533674627   beta =  2.59444e+00
+Iteration   91: alpha =     4.924757778860   beta =  7.53649e+00
+Iteration   92: alpha =    20.927918708401   beta =  1.80588e+00
+Iteration   93: alpha =     7.790587050661   beta =  8.60193e+00
+Iteration   94: alpha =    18.007705087193   beta =  1.71880e+00
+Iteration   95: alpha =    18.739825120194   beta =  8.54627e+00
+Iteration   96: alpha =     7.100934013890   beta =  2.68250e+00
+Iteration   97: alpha =    17.098148972879   beta =  9.24823e+00
+Iteration   98: alpha =    10.094405469075   beta =  2.10228e+00
+Iteration   99: alpha =     7.891138520980   beta =  6.96017e+00
+Iteration  100: alpha =    20.964775615190   beta =  1.77076e+00
+Iteration  101: alpha =    16.114198362404   beta =  9.48461e+00
+Iteration  102: alpha =     9.417141737054   beta =  1.54674e+00
+Iteration  103: alpha =    15.909183118019   beta =  9.54866e+00
+Iteration  104: alpha =    10.142748691582   beta =  3.11857e+00
+Iteration  105: alpha =    11.831855990240   beta =  8.92998e+00
+Iteration  106: alpha =    16.273662141478   beta =  1.36686e+00
+Iteration  107: alpha =    20.361449713351   beta =  7.82468e+00
+Iteration  108: alpha =     6.833465035585   beta =  2.24879e+00
+Iteration  109: alpha =    22.749836145331   beta =  4.62899e+00
+Iteration  110: alpha =     4.269935073775   beta =  4.22883e+00
+Iteration  111: alpha =    17.767160505332   beta =  7.72910e+00
+Iteration  112: alpha =     9.408473914923   beta =  1.63820e+00
+Iteration  113: alpha =    23.786496426896   beta =  1.22602e+00
+Iteration  114: alpha =    12.873914506597   beta =  9.72686e+00
+Iteration  115: alpha =    14.383871014646   beta =  3.79707e+00
+Iteration  116: alpha =     6.716910242288   beta =  6.89093e+00
+Iteration  117: alpha =    19.997142613858   beta =  1.10515e+00
+Iteration  118: alpha =    22.133913633878   beta =  5.93412e+00
+Iteration  119: alpha =     4.214709478044   beta =  3.57937e+00
+Iteration  120: alpha =    20.125382168999   beta =  5.28129e+00
+Iteration  121: alpha =     7.736954192333   beta =  2.50481e+00
+Iteration  122: alpha =    20.690559986845   beta =  5.84131e+00
+Iteration  123: alpha =     4.093089998966   beta =  2.73852e+00
+Iteration  124: alpha =    21.200526697696   beta =  5.96122e+00
+Iteration  125: alpha =     8.340827280743   beta =  2.48785e+00
+Iteration  126: alpha =    21.607641742724   beta =  3.28265e+00
+Iteration  127: alpha =     4.672314056758   beta =  6.46361e+00
+Iteration  128: alpha =    20.710665397013   beta =  3.85268e+00
+Iteration  129: alpha =     7.643252686422   beta =  4.52904e+00
+Iteration  130: alpha =    22.551888791320   beta =  1.37681e+00
+Iteration  131: alpha =     9.320114172549   beta =  1.00259e+01
+Iteration  132: alpha =    15.903608806329   beta =  2.62556e+00
+Iteration  133: alpha =    10.251409979065   beta =  8.65178e+00
+Iteration  134: alpha =    18.796076589406   beta =  1.53839e+00
+Iteration  135: alpha =     7.492496563156   beta =  9.21833e+00
+Iteration  136: alpha =    17.620402868831   beta =  2.38480e+00
+Iteration  137: alpha =    10.006845411509   beta =  8.17786e+00
+Iteration  138: alpha =    18.876840433931   beta =  1.46085e+00
+Iteration  139: alpha =     5.768049513490   beta =  8.13178e+00
+Iteration  140: alpha =    19.606690772740   beta =  2.30124e+00
+Iteration  141: alpha =    11.640726179645   beta =  8.75839e+00
+Iteration  142: alpha =    17.210691746339   beta =  1.95895e+00
+Iteration  143: alpha =     8.446262867489   beta =  9.54230e+00
+Iteration  144: alpha =    16.614207325195   beta =  2.04280e+00
+Iteration  145: alpha =    10.382202451828   beta =  8.01341e+00
+Iteration  146: alpha =    17.074543486130   beta =  1.77919e+00
+Iteration  147: alpha =     9.427861978112   beta =  9.88898e+00
+Iteration  148: alpha =    16.362944543521   beta =  1.76897e+00
+Iteration  149: alpha =    10.355832494139   beta =  9.06641e+00
+Iteration  150: alpha =    17.104809722762   beta =  2.09164e+00
+Iteration  151: alpha =     5.740733599899   beta =  6.31495e+00
+Iteration  152: alpha =    19.530345390127   beta =  4.45646e+00
+Iteration  153: alpha =     5.733517720656   beta =  3.26350e+00
+Iteration  154: alpha =    22.033462110499   beta =  5.28219e+00
+Iteration  155: alpha =     6.611059013293   beta =  3.27749e+00
+Iteration  156: alpha =    19.538489807668   beta =  7.65854e+00
+Iteration  157: alpha =     5.585864115368   beta =  1.88343e+00
+Iteration  158: alpha =    21.105662921355   beta =  6.02297e+00
+Iteration  159: alpha =     7.521982242911   beta =  2.83267e+00
+Iteration  160: alpha =    19.635562401325   beta =  7.69100e+00
+Iteration  161: alpha =     7.024977390904   beta =  2.63115e+00
+Iteration  162: alpha =    16.451245540655   beta =  9.34531e+00
+Iteration  163: alpha =    11.274873887137   beta =  2.44805e+00
+Iteration  164: alpha =    15.904952456170   beta =  9.61550e+00
+Iteration  165: alpha =    10.744867581737   beta =  2.05517e+00
+Iteration  166: alpha =    10.701685105044   beta =  9.40667e+00
+Iteration  167: alpha =    15.936340991132   beta =  1.45635e+00
+Iteration  168: alpha =    15.821185505473   beta =  8.79919e+00
+Iteration  169: alpha =    10.955596115954   beta =  2.22768e+00
+Iteration  170: alpha =    10.923979598126   beta =  9.70591e+00
+Iteration  171: alpha =    16.010862784859   beta =  2.34030e+00
+Iteration  172: alpha =     9.014136539384   beta =  8.38158e+00
+Iteration  173: alpha =    18.130915415900   beta =  2.14325e+00
+Iteration  174: alpha =     8.363660540052   beta =  9.01299e+00
+Iteration  175: alpha =    19.061405930531   beta =  2.95794e+00
+Iteration  176: alpha =     6.805135262599   beta =  6.19206e+00
+Iteration  177: alpha =    20.713798930603   beta =  2.20863e+00
+Iteration  178: alpha =     5.169574619125   beta =  6.07255e+00
+Iteration  179: alpha =    20.454589743324   beta =  3.82132e+00
+Iteration  180: alpha =     6.071141676807   beta =  4.96764e+00
+Iteration  181: alpha =    22.077221202319   beta =  2.32483e+00
+Iteration  182: alpha =     8.045571020740   beta =  8.00179e+00
+Iteration  183: alpha =    18.576417107801   beta =  2.55453e+00
+Iteration  184: alpha =     9.477044165256   beta =  8.93491e+00
+Iteration  185: alpha =    17.380421591219   beta =  2.08730e+00
+Iteration  186: alpha =     7.573347941749   beta =  7.69095e+00
+Iteration  187: alpha =    19.384331970314   beta =  1.62862e+00
+Iteration  188: alpha =     7.362090893789   beta =  6.76652e+00
+Iteration  189: alpha =    19.412056257199   beta =  2.88564e+00
+Iteration  190: alpha =     3.981556902267   beta =  3.30558e+00
+Iteration  191: alpha =    21.745781819155   beta =  4.82491e+00
+Iteration  192: alpha =     6.131610132313   beta =  3.45602e+00
+Iteration  193: alpha =    21.803432091110   beta =  4.33336e+00
+Iteration  194: alpha =     5.238209153234   beta =  2.49105e+00
+Iteration  195: alpha =    18.394480256264   beta =  8.29324e+00
+Iteration  196: alpha =     7.681137673089   beta =  1.52952e+00
+Iteration  197: alpha =    13.511599261662   beta =  9.68513e+00
+Iteration  198: alpha =    12.646801566477   beta =  2.02271e+00
+Iteration  199: alpha =     4.674934714167   beta =  4.04480e+00
+Iteration  200: alpha =    20.386709255080   beta =  4.58326e+00
+Iteration  201: alpha =     4.996818458195   beta =  2.32497e+00
+Iteration  202: alpha =    19.862198294858   beta =  7.43675e+00
+Iteration  203: alpha =     7.716283700605   beta =  2.36844e+00
+Iteration  204: alpha =    18.140367082766   beta =  9.07903e+00
+Iteration  205: alpha =     8.673604035886   beta =  1.48315e+00
+Iteration  206: alpha =    16.208898701642   beta =  9.12868e+00
+Iteration  207: alpha =    10.793863090393   beta =  1.52998e+00
+Iteration  208: alpha =     9.615935303022   beta =  8.81567e+00
+Iteration  209: alpha =    16.924386976919   beta =  1.44019e+00
+Iteration  210: alpha =     8.447554615873   beta =  8.50283e+00
+Iteration  211: alpha =    18.820970572049   beta =  2.05597e+00
+Iteration  212: alpha =     6.939410120021   beta =  7.34952e+00
+Iteration  213: alpha =    19.447339513708   beta =  1.63799e+00
+Iteration  214: alpha =     5.633718541640   beta =  5.73793e+00
+Iteration  215: alpha =    20.321182679271   beta =  2.97678e+00
+Iteration  216: alpha =     4.550837941662   beta =  3.01637e+00
+Iteration  217: alpha =    20.284578698868   beta =  6.37452e+00
+Iteration  218: alpha =     6.336000664642   beta =  1.69470e+00
+Iteration  219: alpha =    19.040259780501   beta =  8.27101e+00
+Iteration  220: alpha =     8.364551051458   beta =  1.92716e+00
+Iteration  221: alpha =    21.428425414214   beta =  5.94610e+00
+Iteration  222: alpha =     5.423906051648   beta =  1.67197e+00
+Iteration  223: alpha =    15.829374484432   beta =  9.38529e+00
+Iteration  224: alpha =    10.570377935779   beta =  1.52531e+00
+Iteration  225: alpha =    13.776119706487   beta =  9.79144e+00
+Iteration  226: alpha =    13.667504776430   beta =  1.78673e+00
+Iteration  227: alpha =    10.477870629626   beta =  9.44679e+00
+Iteration  228: alpha =    15.800105427823   beta =  1.67729e+00
+Iteration  229: alpha =    11.993660581572   beta =  9.43966e+00
+Iteration  230: alpha =    14.389693969023   beta =  2.12729e+00
+Iteration  231: alpha =    17.454806496262   beta =  9.45297e+00
+Iteration  232: alpha =    10.375008990465   beta =  1.93054e+00
+Iteration  233: alpha =    17.094034998958   beta =  8.63398e+00
+Iteration  234: alpha =     8.980948393420   beta =  1.23693e+00
+Iteration  235: alpha =     9.581550599419   beta =  8.63408e+00
+Iteration  236: alpha =    17.749443648042   beta =  2.07050e+00
+Iteration  237: alpha =     9.195269708041   beta =  8.85202e+00
+Iteration  238: alpha =    17.737120263543   beta =  1.91902e+00
+Iteration  239: alpha =     6.433113174233   beta =  6.49094e+00
+Iteration  240: alpha =    21.005541332242   beta =  2.42527e+00
+Iteration  241: alpha =     8.651682428842   beta =  8.67426e+00
+Iteration  242: alpha =    19.029583456397   beta =  2.24074e+00
+Iteration  243: alpha =     5.669246530701   beta =  5.01600e+00
+Iteration  244: alpha =    21.065377212843   beta =  3.55227e+00
+Iteration  245: alpha =     3.864389288798   beta =  3.01433e+00
+Iteration  246: alpha =    20.295454971549   beta =  6.29334e+00
+Iteration  247: alpha =     5.339573355634   beta =  1.80968e+00
+Iteration  248: alpha =    13.143170961756   beta =  9.47302e+00
+Iteration  249: alpha =    12.709574815848   beta =  1.52540e+00
+Iteration  250: alpha =     7.284101592446   beta =  7.49578e+00
+Iteration  251: alpha =    19.304810221722   beta =  2.16201e+00
+Iteration  252: alpha =     6.399880123970   beta =  6.65493e+00
+Iteration  253: alpha =    20.404044878769   beta =  2.60625e+00
+Iteration  254: alpha =     5.171817764438   beta =  4.87157e+00
+Iteration  255: alpha =    21.553894344049   beta =  3.34020e+00
+Iteration  256: alpha =     5.235650836359   beta =  3.96557e+00
+Iteration  257: alpha =    20.873535924638   beta =  3.98891e+00
+Iteration  258: alpha =     4.743350589120   beta =  1.78968e+00
+Iteration  259: alpha =    15.406977126395   beta =  9.60118e+00
+Iteration  260: alpha =     9.714523647445   beta =  1.38881e+00
+Iteration  261: alpha =     8.128662068634   beta =  8.49981e+00
+Iteration  262: alpha =    18.009904112444   beta =  2.23072e+00
+Iteration  263: alpha =     6.882518932048   beta =  6.66030e+00
+Iteration  264: alpha =    20.527262546768   beta =  2.89815e+00
+Iteration  265: alpha =     5.469237630805   beta =  3.84889e+00
+Iteration  266: alpha =    21.287360206806   beta =  4.96542e+00
+Iteration  267: alpha =     5.808085384363   beta =  1.78507e+00
+Iteration  268: alpha =    16.970514706409   beta =  8.71445e+00
+Iteration  269: alpha =     9.185719375735   beta =  1.15300e+00
+Iteration  270: alpha =     5.944134377014   beta =  6.20060e+00
+Iteration  271: alpha =    20.264110602015   beta =  2.31011e+00
+Iteration  272: alpha =     4.056830753913   beta =  2.65708e+00
+Iteration  273: alpha =    21.845794891863   beta =  4.85583e+00
+Iteration  274: alpha =     4.660647480002   beta =  2.12399e+00
+Iteration  275: alpha =    20.349442079014   beta =  6.11109e+00
+Iteration  276: alpha =     6.072687929085   beta =  1.21937e+00
+Iteration  277: alpha =    11.786273463361   beta =  9.34274e+00
+Iteration  278: alpha =    14.663697652056   beta =  1.18741e+00
+Iteration  279: alpha =     6.592782616815   beta =  7.12524e+00
+Iteration  280: alpha =    20.094115863800   beta =  2.83723e+00
+Iteration  281: alpha =     4.435741884295   beta =  2.52051e+00
+Iteration  282: alpha =    21.198143697385   beta =  4.54274e+00
+Iteration  283: alpha =     4.433778812641   beta =  1.80803e+00
+Iteration  284: alpha =    18.161419666647   beta =  7.91807e+00
+Iteration  285: alpha =     8.739271058625   beta =  1.79684e+00
+Iteration  286: alpha =    15.636998320830   beta =  9.70014e+00
+Iteration  287: alpha =    11.431143865225   beta =  2.05490e+00
+Iteration  288: alpha =    16.708895152481   beta =  8.95818e+00
+Iteration  289: alpha =     9.735648217488   beta =  1.07330e+00
+Iteration  290: alpha =     5.122877423348   beta =  5.52248e+00
+Iteration  291: alpha =    21.052227757376   beta =  1.57383e+00
+Iteration  292: alpha =     5.596475321157   beta =  5.64649e+00
+Iteration  293: alpha =    20.383529995840   beta =  3.39184e+00
+Iteration  294: alpha =     5.600469466616   beta =  4.91519e+00
+Iteration  295: alpha =    22.140327493938   beta =  3.25741e+00
+Iteration  296: alpha =     4.202218671917   beta =  1.69641e+00
+Iteration  297: alpha =    18.151268731575   beta =  7.98158e+00
+Iteration  298: alpha =     8.436386879099   beta =  9.85989e-01
+Iteration  299: alpha =     6.311791076223   beta =  6.67252e+00
+Iteration  300: alpha =    20.044333883651   beta =  2.09744e+00
+Iteration  301: alpha =     3.999981480939   beta =  2.54931e+00
+Iteration  302: alpha =    19.758927311742   beta =  6.97751e+00
+Iteration  303: alpha =     7.048569908431   beta =  1.24884e+00
+Iteration  304: alpha =    16.107660045660   beta =  9.39048e+00
+Iteration  305: alpha =    10.200506130002   beta =  9.52763e-01
+Iteration  306: alpha =     6.158580149691   beta =  5.96206e+00
+Iteration  307: alpha =    20.465847280275   beta =  2.50925e+00
+Iteration  308: alpha =     4.178056140304   beta =  2.59070e+00
+Iteration  309: alpha =    20.946351980997   beta =  4.26024e+00
+Iteration  310: alpha =     4.723877415407   beta =  1.25845e+00
+Iteration  311: alpha =    12.725258912349   beta =  9.39126e+00
+Iteration  312: alpha =    13.370645401115   beta =  1.19570e+00
+Iteration  313: alpha =     3.905483953979   beta =  2.11162e+00
+Iteration  314: alpha =    19.376342442071   beta =  6.84180e+00
+Iteration  315: alpha =     6.944663468147   beta =  9.06536e-01
+Iteration  316: alpha =     3.889521044389   beta =  2.42340e+00
+Iteration  317: alpha =    21.541045961345   beta =  4.14572e+00
+Iteration  318: alpha =     4.083616753255   beta =  1.81768e+00
+Iteration  319: alpha =    19.803104084431   beta =  6.70654e+00
+Iteration  320: alpha =     6.321803380494   beta =  1.01270e+00
+Iteration  321: alpha =     4.437745363996   beta =  3.61722e+00
+Iteration  322: alpha =    21.060446953720   beta =  4.15891e+00
+Iteration  323: alpha =     4.836092893009   beta =  9.53831e-01
+Iteration  324: alpha =     7.311043328428   beta =  7.16066e+00
+Iteration  325: alpha =    19.550808770123   beta =  2.00009e+00
+Iteration  326: alpha =     3.497034331177   beta =  9.74181e-01
+Iteration  327: alpha =     6.061839859162   beta =  5.84957e+00
+Iteration  328: alpha =    20.019920549425   beta =  2.41896e+00
+Iteration  329: alpha =     3.627880176943   beta =  1.04303e+00
+Iteration  330: alpha =     8.672186945280   beta =  8.40520e+00
+Iteration  331: alpha =    18.174061695859   beta =  1.74798e+00
+Iteration  332: alpha =     4.952641904324   beta =  5.26738e+00
+Iteration  333: alpha =    20.816780325079   beta =  2.83865e+00
+Iteration  334: alpha =     3.556885969549   beta =  1.08161e+00
+Iteration  335: alpha =    15.103235165940   beta =  9.86688e+00
+Iteration  336: alpha =    11.215022523749   beta =  1.11971e+00
+Iteration  337: alpha =     6.122943338632   beta =  6.31525e+00
+Iteration  338: alpha =    20.199302984077   beta =  1.95724e+00
+Iteration  339: alpha =     3.555744574883   beta =  8.07262e-01
+Iteration  340: alpha =     4.660431776660   beta =  2.69949e+00
+Iteration  341: alpha =    19.882189348617   beta =  6.38037e+00
+Iteration  342: alpha =     5.911846651798   beta =  6.72778e-01
+Iteration  343: alpha =     3.359781660510   beta =  7.68756e-01
+Iteration  344: alpha =     5.115591525650   beta =  4.58995e+00
+Iteration  345: alpha =    20.830047620647   beta =  3.57792e+00
+Iteration  346: alpha =     4.580173281157   beta =  1.05039e+00
+Iteration  347: alpha =    12.774181866357   beta =  9.79653e+00
+Iteration  348: alpha =    13.496186074150   beta =  1.01932e+00
+Iteration  349: alpha =     3.831962557794   beta =  6.24899e-01
+Iteration  350: alpha =     3.187919999559   beta =  9.86834e-01
+Iteration  351: alpha =    14.184826318727   beta =  9.27849e+00
+Iteration  352: alpha =    11.533343449709   beta =  1.28602e+00
+Iteration  353: alpha =     4.022931254606   beta =  1.22601e+00
+Iteration  354: alpha =    14.584622422779   beta =  9.63677e+00
+Iteration  355: alpha =    11.759456053923   beta =  9.17042e-01
+Iteration  356: alpha =     3.650479926759   beta =  7.38399e-01
+Iteration  357: alpha =     3.449616355173   beta =  1.49389e+00
+Iteration  358: alpha =    20.910966509115   beta =  5.13789e+00
+Iteration  359: alpha =     4.776768950067   beta =  9.38455e-01
+Iteration  360: alpha =     8.433351450090   beta =  8.31630e+00
+Iteration  361: alpha =    17.917672383535   beta =  1.13588e+00
+Iteration  362: alpha =     3.836916989767   beta =  2.86317e+00
+Iteration  363: alpha =    21.352094967182   beta =  3.94368e+00
+Iteration  364: alpha =     4.323852726385   beta =  8.89644e-01
+Iteration  365: alpha =     4.231030147004   beta =  7.82451e-01
+Iteration  366: alpha =     3.446656853635   beta =  5.48454e-01
+Iteration  367: alpha =     3.335041792876   beta =  5.56970e-01
+Iteration  368: alpha =     3.720824618480   beta =  6.24001e-01
+Iteration  369: alpha =     3.467976440433   beta =  6.28767e-01
+Iteration  370: alpha =     3.199277010830   beta =  6.10755e-01
+Iteration  371: alpha =     3.509205554101   beta =  9.91929e-01
+Iteration  372: alpha =     4.240823348779   beta =  5.93299e-01
+Iteration  373: alpha =     3.051601288790   beta =  5.26710e-01
+Iteration  374: alpha =     3.173576188710   beta =  5.31200e-01
+Iteration  375: alpha =     3.311609385061   beta =  6.77834e-01
+Iteration  376: alpha =     3.771554287701   beta =  5.15253e-01
+Iteration  377: alpha =     2.980103351921   beta =  6.01813e-01
+Iteration  378: alpha =     3.545575079214   beta =  5.73792e-01
+Iteration  379: alpha =     3.640262032442   beta =  6.94795e-01
+Iteration  380: alpha =     3.206999900149   beta =  4.93629e-01
+Iteration  381: alpha =     3.277791547827   beta =  6.85324e-01
+Iteration  382: alpha =     3.533647984466   beta =  5.95394e-01
+Iteration  383: alpha =     3.636815405294   beta =  4.58579e-01
+Iteration  384: alpha =     3.280805122498   beta =  5.88280e-01
+Iteration  385: alpha =     4.347015667992   beta =  9.36164e-01
+Iteration  386: alpha =     3.978308160491   beta =  5.70788e-01
+Iteration  387: alpha =     3.628079341899   beta =  7.01056e-01
+Iteration  388: alpha =     3.547700952497   beta =  5.61019e-01
+Iteration  389: alpha =     3.044605368320   beta =  5.78410e-01
+Iteration  390: alpha =     3.419312392891   beta =  8.19817e-01
+Iteration  391: alpha =     4.069081668045   beta =  7.16068e-01
+Iteration  392: alpha =     4.061183597520   beta =  8.12468e-01
+Iteration  393: alpha =     3.768440636155   beta =  5.40670e-01
+Iteration  394: alpha =     3.160623605842   beta =  5.79181e-01
+Iteration  395: alpha =     3.529853895653   beta =  8.55976e-01
+Iteration  396: alpha =     4.146738098783   beta =  7.87379e-01
+Iteration  397: alpha =     3.245220405068   beta =  3.85247e-01
+Iteration  398: alpha =     3.493085693200   beta =  5.90184e-01
+Iteration  399: alpha =     3.623175826110   beta =  6.91558e-01
+Iteration  400: alpha =     3.595597649869   beta =  3.34475e-01
+Iteration  401: alpha =     2.954851773013   beta =  3.71039e-01
+Iteration  402: alpha =     3.791203950272   beta =  9.63427e-01
+Iteration  403: alpha =     3.537862447518   beta =  9.35955e-01
+Iteration  404: alpha =     3.742269107601   beta =  9.19776e-01
+Iteration  405: alpha =     3.566387743647   beta =  5.72444e-01
+Iteration  406: alpha =     3.127847757741   beta =  4.03293e-01
+Iteration  407: alpha =     3.315129181524   beta =  5.90050e-01
+Iteration  408: alpha =     3.795148270028   beta =  5.85100e-01
+Iteration  409: alpha =     3.330013637172   beta =  4.61763e-01
+Iteration  410: alpha =     3.335429457679   beta =  4.26039e-01
+Iteration  411: alpha =     3.805538075964   beta =  6.12547e-01
+Iteration  412: alpha =     3.444131695129   beta =  3.46887e-01
+Iteration  413: alpha =     2.984485899525   beta =  4.93086e-01
+Iteration  414: alpha =     3.577951592575   beta =  7.83423e-01
+Iteration  415: alpha =     3.274104915169   beta =  6.70742e-01
+Iteration  416: alpha =     3.010373068135   beta =  4.27270e-01
+Iteration  417: alpha =     3.036002674716   beta =  4.54770e-01
+Iteration  418: alpha =     3.119268277284   beta =  3.63447e-01
+Iteration  419: alpha =     3.404252337606   beta =  5.46575e-01
+Iteration  420: alpha =     3.828451713190   beta =  5.37133e-01
+Iteration  421: alpha =     3.272696556658   beta =  3.70177e-01
+Iteration  422: alpha =     3.197623330365   beta =  6.75724e-01
+Iteration  423: alpha =     3.850688351118   beta =  5.31098e-01
+Iteration  424: alpha =     3.317910680699   beta =  3.98950e-01
+Iteration  425: alpha =     3.964868985946   beta =  8.03498e-01
+Iteration  426: alpha =     3.375409375881   beta =  4.27465e-01
+Iteration  427: alpha =     3.278744100618   beta =  3.72158e-01
+Iteration  428: alpha =     3.467521808762   beta =  6.43770e-01
+Iteration  429: alpha =     3.744209041584   beta =  3.85474e-01
+Iteration  430: alpha =     3.146780993750   beta =  2.18437e-01
+Iteration  431: alpha =     3.147124349589   beta =  2.74194e-01
+Iteration  432: alpha =     3.291645180165   beta =  3.43314e-01
+Iteration  433: alpha =     3.186997416323   beta =  2.56946e-01
+Iteration  434: alpha =     3.350931221640   beta =  3.78700e-01
+Iteration  435: alpha =     3.165974544188   beta =  1.73170e-01
+Iteration  436: alpha =     3.444317471500   beta =  3.42540e-01
+Iteration  437: alpha =     3.237292805023   beta =  2.84030e-01
+Iteration  438: alpha =     3.093470807708   beta =  3.08391e-01
+Iteration  439: alpha =     3.077427188658   beta =  3.52321e-01
+Iteration  440: alpha =     3.249735258471   beta =  5.23297e-01
+Iteration  441: alpha =     3.805336862975   beta =  4.49380e-01
+Iteration  442: alpha =     3.115170327765   beta =  1.86890e-01
+Iteration  443: alpha =     3.090383375964   beta =  1.45727e-01
+Iteration  444: alpha =     2.920121950491   beta =  2.42720e-01
+Iteration  445: alpha =     3.232364016332   beta =  2.52070e-01
+Iteration  446: alpha =     3.184709159927   beta =  4.71343e-01
+Iteration  447: alpha =     4.162860164754   beta =  6.15507e-01
+Iteration  448: alpha =     2.752230457335   beta =  3.10974e-01
+Iteration  449: alpha =     3.041865611608   beta =  4.53868e-01
+Iteration  450: alpha =     3.265089108653   beta =  2.55391e-01
+Iteration  451: alpha =     3.076784162819   beta =  1.47099e-01
+Iteration  452: alpha =     3.073503352427   beta =  3.31856e-01
+Iteration  453: alpha =     3.079544367974   beta =  3.29775e-01
+Iteration  454: alpha =     2.632463115099   beta =  2.41654e-01
+Iteration  455: alpha =     3.064695790590   beta =  9.99920e-02
+Iteration  456: alpha =     3.141560926245   beta =  1.74562e-01
+Iteration  457: alpha =     2.950047393028   beta =  2.16614e-01
+Iteration  458: alpha =     3.167917550680   beta =  2.20214e-01
+Iteration  459: alpha =     3.173655584028   beta =  2.49114e-01
+Iteration  460: alpha =     3.042702110835   beta =  8.50737e-02
+Iteration  461: alpha =     2.788177231606   beta =  1.05639e-01
+Iteration  462: alpha =     3.019895966526   beta =  8.35991e-02
+Iteration  463: alpha =     2.978368899682   beta =  9.56626e-02
+Iteration  464: alpha =     3.748604326515   beta =  5.04145e-02
+Iteration  465: alpha =     3.102697736026   beta =  6.26176e-02
+Iteration  466: alpha =     2.977660348268   beta =  2.27596e-01
+Iteration  467: alpha =     2.723448543304   beta =  2.33103e-01
+Iteration  468: alpha =     2.838122001748   beta =  1.38033e-01
+Iteration  469: alpha =     3.376283993362   beta =  2.81268e-01
+Iteration  470: alpha =     3.398500420618   beta =  1.77064e-03
+Iteration  471: alpha =     3.709020990004   beta =  7.97322e-03
+Iteration  472: alpha =     2.953367385975   beta =  3.77012e-01
+Iteration  473: alpha =     3.045948140474   beta =  7.90775e-03
+Iteration  474: alpha =     2.634044379548   beta =  9.82872e-05
+Iteration  475: alpha =     3.331448158474   beta =  1.31171e-01
+Iteration  476: alpha =     3.414912066048   beta =  2.06419e-04
+Iteration  477: alpha =     2.995936271629   beta =  2.23888e-02
+Iteration  478: alpha =     3.038305437526   beta =  6.20592e-02
+Iteration  479: alpha =     2.982507749000   beta =  6.08922e-03
+Iteration  480: alpha =     3.059287096184   beta =  8.85700e-45
+
+Lanczos breakdown/convergence.
+
+========================================
+Lowest Lanczos Ritz values
+========================================
+  0       0.449962619363 Eh      12.24410663 eV
+  1       0.490909076900 Eh      13.35831650 eV
+  2       0.657050529002 Eh      17.87925573 eV
+  3       1.159116512554 Eh      31.54116713 eV
+  4       1.204072108839 Eh      32.76447122 eV
+  5       1.242164031702 Eh      33.80100525 eV
+  6       1.245368833585 Eh      33.88821235 eV
+  7       1.248441626112 Eh      33.97182729 eV
+  8       1.315731448369 Eh      35.80287664 eV
+  9       1.316108811707 Eh      35.81314522 eV
+
+Lanczos basis orthogonality error:
+1.5259304709461082e-14
+
+========================================
+PySCF Davidson reference
+========================================
+
+******** <class 'pyscf.adc.radc_ip.RADCIP'> ********
+max_space = 12
+max_cycle = 50
+conv_tol = 1e-08
+max_memory 4000 MB (current use 169 MB)
+
+*************************************************************
+        ADC calculation summary (doublet states only)
+*************************************************************
+adc(2) root 0  |  Energy (Eh) =   0.4033859937  |  Energy (eV) =  10.97669199  |  Spec. factor = 1.81611862  |  conv = True
+adc(2) root 1  |  Energy (Eh) =   0.4909104356  |  Energy (eV) =  13.35835336  |  Spec. factor = 1.82734004  |  conv = True
+adc(2) root 2  |  Energy (Eh) =   0.6570360881  |  Energy (eV) =  17.87886262  |  Spec. factor = 1.85818550  |  conv = True
+adc(2) root 3  |  Energy (Eh) =   1.1589258846  |  Energy (eV) =  31.53597962  |  Spec. factor = 0.50027584  |  conv = True
+adc(2) root 4  |  Energy (Eh) =   1.2043287786  |  Energy (eV) =  32.77145529  |  Spec. factor = 1.27096110  |  conv = True
+adc(2) root 5  |  Energy (Eh) =   1.2425999784  |  Energy (eV) =  33.81286768  |  Spec. factor = 0.00055725  |  conv = True
+adc(2) root 6  |  Energy (Eh) =   1.2452122465  |  Energy (eV) =  33.88395112  |  Spec. factor = 0.00002486  |  conv = True
+adc(2) root 7  |  Energy (Eh) =   1.2508150039  |  Energy (eV) =  34.03640991  |  Spec. factor = 0.01079072  |  conv = True
+adc(2) root 8  |  Energy (Eh) =   1.3159405863  |  Energy (eV) =  35.80856727  |  Spec. factor = 0.00004743  |  conv = True
+adc(2) root 9  |  Energy (Eh) =   1.3159405863  |  Energy (eV) =  35.80856727  |  Spec. factor = 0.00005302  |  conv = True
+
+========================================
+Davidson vs Lanczos
+========================================
+ root        Davidson / Eh         Lanczos / Eh       difference
+    0       0.403385993748       0.449962619363     4.657663e-02
+    1       0.490910435616       0.490909076900    -1.358716e-06
+    2       0.657036088064       0.657050529002     1.444094e-05
+    3       1.158925884621       1.159116512554     1.906279e-04
+    4       1.204328778586       1.204072108839    -2.566697e-04
+    5       1.242599978352       1.242164031702    -4.359467e-04
+    6       1.245212246475       1.245368833585     1.565871e-04
+    7       1.250815003936       1.248441626112    -2.373378e-03
+    8       1.315940586347       1.315731448369    -2.091380e-04
+    9       1.315940586347       1.316108811707     1.682254e-04
+The job finished:  Mon Sep 28 18:29:21 CEST 2026

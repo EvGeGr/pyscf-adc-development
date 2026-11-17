@@ -1,0 +1,549 @@
+#INFO: **** input file is /home/evgeniy/prog/pyscf/pyscf/adc/test_lanczos/ip_adc_lanczos.py ****
+import numpy as np
+
+from pyscf import gto, scf, adc
+from pyscf.adc import radc_ip
+
+
+# ============================================================
+# Symmetric Lanczos with full reorthogonalization
+# ============================================================
+
+def lanczos(matvec, v0, maxiter=100, tol=1.0e-12):
+    """
+    Standard symmetric Lanczos algorithm.
+
+    Parameters
+    ----------
+    matvec : callable
+        Function returning A @ x.
+    v0 : ndarray
+        Initial vector.
+    maxiter : int
+        Maximum Krylov dimension.
+    tol : float
+        Breakdown threshold.
+
+    Returns
+    -------
+    alpha : ndarray
+        Diagonal elements of the Lanczos matrix.
+    beta : ndarray
+        Off-diagonal elements of the Lanczos matrix.
+    Q : ndarray
+        Lanczos basis vectors as columns.
+    """
+
+    q = np.asarray(v0, dtype=float).copy()
+
+    norm = np.linalg.norm(q)
+    if norm < tol:
+        raise ValueError("Initial Lanczos vector has zero norm.")
+
+    q /= norm
+
+    n = q.size
+
+    Q = np.zeros((n, maxiter), dtype=float)
+    alpha = np.zeros(maxiter, dtype=float)
+    beta = np.zeros(maxiter - 1, dtype=float)
+
+    q_prev = np.zeros_like(q)
+    beta_prev = 0.0
+
+    m = 0
+
+    for j in range(maxiter):
+
+        Q[:, j] = q
+
+        # Matrix-vector product
+        z = matvec(q)
+
+        # alpha_j = q_j^T A q_j
+        alpha[j] = np.dot(q, z)
+
+        # Three-term Lanczos recurrence
+        z -= alpha[j] * q
+
+        if j > 0:
+            z -= beta_prev * q_prev
+
+        # ----------------------------------------------------
+        # Full reorthogonalization
+        # ----------------------------------------------------
+        # This is intentionally used for the first implementation.
+        # It makes the numerical comparison with Davidson cleaner.
+        #
+        # Two passes improve numerical orthogonality.
+        # ----------------------------------------------------
+
+        Qj = Q[:, :j+1]
+
+        for _ in range(2):
+            coeff = Qj.T @ z
+            z -= Qj @ coeff
+
+        b = np.linalg.norm(z)
+
+        m = j + 1
+
+        print(
+            f"Iteration {j+1:4d}: "
+            f"alpha = {alpha[j]:18.12f}   "
+            f"beta = {b:12.5e}"
+        )
+
+        if b < tol:
+            print("\nLanczos breakdown/convergence.")
+            break
+
+        if j == maxiter - 1:
+            break
+
+        beta[j] = b
+
+        q_prev = q.copy()
+        q = z / b
+        beta_prev = b
+
+    alpha = alpha[:m]
+
+    if m > 1:
+        beta = beta[:m-1]
+    else:
+        beta = np.empty(0)
+
+    Q = Q[:, :m]
+
+    return alpha, beta, Q
+
+
+# ============================================================
+# Construct tridiagonal Lanczos matrix
+# ============================================================
+
+def make_tridiagonal(alpha, beta):
+
+    m = len(alpha)
+
+    T = np.diag(alpha)
+
+    if m > 1:
+        idx = np.arange(m - 1)
+
+        T[idx, idx + 1] = beta
+        T[idx + 1, idx] = beta
+
+    return T
+
+
+# ============================================================
+# Test system
+# ============================================================
+
+mol = gto.M(
+    atom="""
+    O   0.000000   0.000000   0.000000
+    H   0.000000  -0.757000   0.587000
+    H   0.000000   0.757000   0.587000
+    """,
+    basis="cc-pvdz",
+    verbose=4,
+)
+
+mf = scf.RHF(mol)
+mf.kernel()
+
+
+# ============================================================
+# ADC ground-state calculation
+# ============================================================
+
+myadc = adc.ADC(mf)
+
+myadc.method = "adc(2)"
+myadc.method_type = "ip"
+
+myadc.kernel_gs()
+
+
+# ============================================================
+# Construct IP-ADC object
+# ============================================================
+
+myadcip = radc_ip.RADCIP(myadc)
+
+
+# ============================================================
+# Build integrals and IP-ADC matrix-vector function
+#
+# This follows exactly the beginning of radc.kernel():
+#
+#     eris = adc.transform_integrals()
+#     imds = adc.get_imds(eris)
+#     matvec, diag = adc.gen_matvec(imds, eris)
+#
+# ============================================================
+
+eris = myadcip.transform_integrals()
+
+imds = myadcip.get_imds(eris)
+
+matvec, diag = myadcip.gen_matvec(imds, eris)
+
+
+dim = len(diag)
+
+print()
+print("========================================")
+print("IP-ADC matrix dimension =", dim)
+print("========================================")
+print()
+
+
+# ============================================================
+# Initial Lanczos vector
+#
+# For this numerical test use the basis vector corresponding
+# to the smallest diagonal matrix element.
+# ============================================================
+
+i0 = np.argmin(diag)
+
+v0 = np.zeros(dim)
+v0[i0] = 1.0
+
+print("Initial vector index:", i0)
+print("Initial diagonal element:", diag[i0])
+
+
+# ============================================================
+# Lanczos
+# ============================================================
+
+maxiter = min(100, dim)
+
+alpha, beta, Q = lanczos(
+    matvec,
+    v0,
+    maxiter=maxiter,
+    tol=1.0e-12,
+)
+
+T = make_tridiagonal(alpha, beta)
+
+ritz_values, ritz_vectors = np.linalg.eigh(T)
+
+
+print()
+print("========================================")
+print("Lowest Lanczos Ritz values")
+print("========================================")
+
+for i, e in enumerate(ritz_values[:10]):
+    print(f"{i:3d}   {e:18.12f} Eh   {e * 27.211386245988:14.8f} eV")
+
+
+# ============================================================
+# Check orthogonality of Lanczos basis
+# ============================================================
+
+orth_error = np.linalg.norm(
+    Q.T @ Q - np.eye(Q.shape[1])
+)
+
+print()
+print("Lanczos basis orthogonality error:")
+print(orth_error)
+
+
+# ============================================================
+# Davidson reference
+#
+# Use exactly the same IP-ADC object.
+# ============================================================
+
+print()
+print("========================================")
+print("PySCF Davidson reference")
+print("========================================")
+
+nroots = min(10, dim)
+
+E_dav, U_dav, P_dav, X_dav = myadcip.kernel(
+    nroots=nroots,
+    eris=eris,
+)
+
+
+print()
+print("========================================")
+print("Davidson vs Lanczos")
+print("========================================")
+
+print(
+    f"{'root':>5s} "
+    f"{'Davidson / Eh':>20s} "
+    f"{'Lanczos / Eh':>20s} "
+    f"{'difference':>16s}"
+)
+
+for i in range(min(nroots, len(ritz_values))):
+
+    diff = ritz_values[i] - E_dav[i]
+
+    print(
+        f"{i:5d} "
+        f"{E_dav[i]:20.12f} "
+        f"{ritz_values[i]:20.12f} "
+        f"{diff:16.6e}"
+    )
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='node04', release='6.8.0-110-generic', version='#110-Ubuntu SMP PREEMPT_DYNAMIC Thu Mar 19 15:09:20 UTC 2026', machine='x86_64')  Threads 8
+Python 3.14.7 | packaged by Anaconda, Inc. | (main, Aug 14 2026, 10:21:40) [GCC 14.3.0]
+numpy 2.5.2  scipy 1.18.1  h5py 3.16.0
+Date: Mon Sep 28 18:18:52 2026
+PySCF version 2.14.0
+PySCF path  /home/evgeniy/prog/pyscf
+GIT ORIG_HEAD 34e5aa023afaf42157932b2b0e35e716f7af0b14
+GIT HEAD (branch master) e47d1279f72ffd50cbad43fbfed50511d8415b7e
+
+[ENV] PYSCF_TMPDIR /scratch/evgeniy/pyscf-test
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 3
+[INPUT] num. electrons = 10
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 0
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+[INPUT]  1 O      0.000000000000   0.000000000000   0.000000000000 AA    0.000000000000   0.000000000000   0.000000000000 Bohr   0.0
+[INPUT]  2 H      0.000000000000  -0.757000000000   0.587000000000 AA    0.000000000000  -1.430522676296   1.109269235120 Bohr   0.0
+[INPUT]  3 H      0.000000000000   0.757000000000   0.587000000000 AA    0.000000000000   1.430522676296   1.109269235120 Bohr   0.0
+
+nuclear repulsion = 9.18825841774611
+number of shells = 11
+number of NR pGTOs = 40
+number of NR cGTOs = 24
+basis = cc-pvdz
+ecp = {}
+CPU time:         1.44
+
+
+******** <class 'pyscf.scf.hf.RHF'> ********
+method = RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /scratch/evgeniy/pyscf-test/tmpt6d4pg22
+max_memory 4000 MB (current use 127 MB)
+Set gradient conv threshold to 3.16228e-05
+Initial guess from minao.
+init E= -75.8564886162471
+  HOMO = -0.476818251418615  LUMO = 0.100626554688236  gap/eV = 15.71307
+cycle= 1 E= -75.9878157199693  delta_E= -0.131  |g|= 0.448  |ddm|= 1.31
+  HOMO = -0.412638622054451  LUMO = 0.186492856349362  gap/eV = 16.30320
+cycle= 2 E= -76.0177142185363  delta_E= -0.0299  |g|= 0.228  |ddm|= 0.37
+  HOMO = -0.498200382859054  LUMO = 0.180827609256028  gap/eV = 18.47729
+cycle= 3 E= -76.0265825515462  delta_E= -0.00887  |g|= 0.0245  |ddm|= 0.13
+  HOMO = -0.491201369420486  LUMO = 0.185596353732397  gap/eV = 18.41660
+cycle= 4 E= -76.0267512314625  delta_E= -0.000169  |g|= 0.00587  |ddm|= 0.0181
+  HOMO = -0.492724703264163  LUMO = 0.185526872973993  gap/eV = 18.45617
+cycle= 5 E= -76.0267651795248  delta_E= -1.39e-05  |g|= 0.000977  |ddm|= 0.00645
+  HOMO = -0.493079624821707  LUMO = 0.18544393389561  gap/eV = 18.46357
+cycle= 6 E= -76.0267656607416  delta_E= -4.81e-07  |g|= 0.00015  |ddm|= 0.00138
+  HOMO = -0.493134919327479  LUMO = 0.18543752261983  gap/eV = 18.46490
+cycle= 7 E= -76.0267656729544  delta_E= -1.22e-08  |g|= 1.64e-05  |ddm|= 0.000264
+  HOMO = -0.493133773976767  LUMO = 0.185436743480236  gap/eV = 18.46484
+cycle= 8 E= -76.0267656731084  delta_E= -1.54e-10  |g|= 3.88e-06  |ddm|= 2.65e-05
+  HOMO = -0.493132772871721  LUMO = 0.185436779986021  gap/eV = 18.46482
+Extra cycle  E= -76.0267656731174  delta_E= -9.05e-12  |g|= 1.69e-06  |ddm|= 5.44e-06
+converged SCF energy = -76.0267656731174
+
+******** <class 'pyscf.adc.radc.RADC'> ********
+max_memory 4000 MB (current use 136 MB)
+******** ADC Orbital Information ********
+Number of Frozen Occupied Orbitals: 0
+Number of Frozen Virtual Orbitals: 0
+Number of Active Occupied Orbitals: 5
+Number of Active Virtual Orbitals: 19
+*****************************************
+Reference correlation energy (doubles): -0.20401998
+MP2 correlation energy of reference state (a.u.) = -0.20401998
+
+========================================
+IP-ADC matrix dimension = 480
+========================================
+
+Initial vector index: 4
+Initial diagonal element: 0.547144211095573
+Iteration    1: alpha =     0.547144211096   beta =  4.42217e-01
+Iteration    2: alpha =     3.593119815755   beta =  4.58868e+00
+Iteration    3: alpha =    31.656039600929   beta =  1.19121e+01
+Iteration    4: alpha =    23.073784988087   beta =  1.19999e+01
+Iteration    5: alpha =    14.344768965173   beta =  2.12067e+00
+Iteration    6: alpha =    12.583584414786   beta =  1.02380e+01
+Iteration    7: alpha =    14.519161055992   beta =  3.95186e+00
+Iteration    8: alpha =    32.081332082159   beta =  1.65737e+01
+Iteration    9: alpha =    16.030701338660   beta =  7.39667e+00
+Iteration   10: alpha =    21.487919661942   beta =  5.47837e+00
+Iteration   11: alpha =    31.228085812789   beta =  1.70873e+01
+Iteration   12: alpha =    16.006804576945   beta =  4.39757e+00
+Iteration   13: alpha =    20.647441036937   beta =  6.34054e+00
+Iteration   14: alpha =     6.339418436071   beta =  3.74413e+00
+Iteration   15: alpha =    19.814108698663   beta =  6.50404e+00
+Iteration   16: alpha =     6.061788744085   beta =  2.49716e+00
+Iteration   17: alpha =    17.850087392973   beta =  8.79353e+00
+Iteration   18: alpha =     8.720920169761   beta =  2.29382e+00
+Iteration   19: alpha =    17.731387479999   beta =  8.95705e+00
+Iteration   20: alpha =    10.257641183834   beta =  2.38986e+00
+Iteration   21: alpha =    15.103405005659   beta =  9.59399e+00
+Iteration   22: alpha =    11.686750202604   beta =  1.49555e+00
+Iteration   23: alpha =    11.572268629943   beta =  9.73078e+00
+Iteration   24: alpha =    16.131337616096   beta =  1.97383e+00
+Iteration   25: alpha =     8.971985630613   beta =  8.35598e+00
+Iteration   26: alpha =    17.973005588251   beta =  1.59230e+00
+Iteration   27: alpha =     6.227514674324   beta =  9.50587e+00
+Iteration   28: alpha =    39.664090050879   beta =  8.41331e+00
+Iteration   29: alpha =    21.834931842872   beta =  7.71841e+00
+Iteration   30: alpha =     7.507831691935   beta =  2.23148e+00
+Iteration   31: alpha =    30.269701066536   beta =  1.65563e+01
+Iteration   32: alpha =    18.594292424240   beta =  9.85356e+00
+Iteration   33: alpha =    22.450889924002   beta =  3.94615e+00
+Iteration   34: alpha =    31.687719977539   beta =  1.69748e+01
+Iteration   35: alpha =    15.567856957019   beta =  5.82668e+00
+Iteration   36: alpha =    26.289260961380   beta =  9.21622e+00
+Iteration   37: alpha =    33.745351408067   beta =  1.14809e+01
+Iteration   38: alpha =     8.887040988827   beta =  1.93912e+00
+Iteration   39: alpha =    32.903981059673   beta =  1.45082e+01
+Iteration   40: alpha =    17.228907926106   beta =  1.02356e+01
+Iteration   41: alpha =    19.602096299413   beta =  4.65328e+00
+Iteration   42: alpha =    39.188811883446   beta =  1.14316e+01
+Iteration   43: alpha =     7.715980173239   beta =  3.52443e+00
+Iteration   44: alpha =    26.191746268459   beta =  1.20738e+01
+Iteration   45: alpha =    24.743065242652   beta =  1.44243e+01
+Iteration   46: alpha =    18.587032145681   beta =  1.79910e+00
+Iteration   47: alpha =    27.876808901239   beta =  1.91384e+01
+Iteration   48: alpha =    19.205306102334   beta =  3.37646e+00
+Iteration   49: alpha =    26.542128745778   beta =  1.11924e+01
+Iteration   50: alpha =    27.441249814758   beta =  1.49813e+01
+Iteration   51: alpha =    14.786354443080   beta =  2.18345e+00
+Iteration   52: alpha =    33.157260485064   beta =  1.60844e+01
+Iteration   53: alpha =    12.383480092099   beta =  9.44564e-01
+Iteration   54: alpha =    26.970112156263   beta =  1.92305e+01
+Iteration   55: alpha =    18.628887072645   beta =  7.32237e-01
+Iteration   56: alpha =    25.255426053657   beta =  1.98485e+01
+Iteration   57: alpha =    21.240161962331   beta =  1.36266e+00
+Iteration   58: alpha =    18.313856216368   beta =  1.85546e+01
+Iteration   59: alpha =    27.719448670443   beta =  2.21279e+00
+Iteration   60: alpha =    23.566320280218   beta =  8.10121e+00
+Iteration   61: alpha =    10.180242119018   beta =  1.10739e+01
+Iteration   62: alpha =    38.373411803307   beta =  2.44129e+00
+Iteration   63: alpha =     7.111863556391   beta =  8.04271e+00
+Iteration   64: alpha =    28.121000298283   beta =  1.23477e+01
+Iteration   65: alpha =    29.588800056435   beta =  5.20077e+00
+Iteration   66: alpha =     5.765250661792   beta =  3.02402e+00
+Iteration   67: alpha =    23.978997563139   beta =  7.01201e+00
+Iteration   68: alpha =    12.967497490061   beta =  1.49035e+01
+Iteration   69: alpha =    34.026917559491   beta =  3.17758e+00
+Iteration   70: alpha =     2.704285966879   beta =  2.76225e+00
+Iteration   71: alpha =    15.748196852779   beta =  8.39179e+00
+Iteration   72: alpha =     7.967951534452   beta =  1.27017e+00
+Iteration   73: alpha =    22.484373416141   beta =  7.15917e+00
+Iteration   74: alpha =     6.581330388428   beta =  9.86829e-01
+Iteration   75: alpha =     4.124782277983   beta =  4.82609e+00
+Iteration   76: alpha =    21.091966076125   beta =  5.52720e+00
+Iteration   77: alpha =     5.673233284896   beta =  6.94015e+00
+Iteration   78: alpha =    19.855442713891   beta =  2.46442e+00
+Iteration   79: alpha =     6.253502580586   beta =  2.99546e+00
+Iteration   80: alpha =    17.325595950560   beta =  8.78081e+00
+Iteration   81: alpha =    10.882917459278   beta =  3.66507e+00
+Iteration   82: alpha =    22.382144361288   beta =  3.79267e+00
+Iteration   83: alpha =     4.288997838205   beta =  2.29972e+00
+Iteration   84: alpha =    23.623169178466   beta =  4.51632e+00
+Iteration   85: alpha =     6.595700504065   beta =  4.04267e+00
+Iteration   86: alpha =    20.887938087365   beta =  4.95218e+00
+Iteration   87: alpha =     9.094208818698   beta =  5.92939e+00
+Iteration   88: alpha =    20.904807983686   beta =  3.97535e+00
+Iteration   89: alpha =     5.328321266697   beta =  5.20956e+00
+Iteration   90: alpha =    22.607628398473   beta =  3.13746e+00
+Iteration   91: alpha =     3.055498132133   beta =  4.27668e+00
+Iteration   92: alpha =    22.570609353962   beta =  2.70043e+00
+Iteration   93: alpha =     7.206437199859   beta =  7.92514e+00
+Iteration   94: alpha =    18.298958381591   beta =  1.45431e+00
+Iteration   95: alpha =    13.927229281192   beta =  1.10046e+01
+Iteration   96: alpha =    12.604201060403   beta =  2.08390e+00
+Iteration   97: alpha =     8.387861355833   beta =  8.00642e+00
+Iteration   98: alpha =    19.177904489461   beta =  3.47914e+00
+Iteration   99: alpha =     6.561933805639   beta =  4.99819e+00
+Iteration  100: alpha =    22.406397234567   beta =  1.87891e+00
+
+========================================
+Lowest Lanczos Ritz values
+========================================
+  0       0.449962619363 Eh      12.24410663 eV
+  1       0.490907956258 Eh      13.35828601 eV
+  2       0.657026946988 Eh      17.87861403 eV
+  3       1.164836140856 Eh      31.69680614 eV
+  4       1.248441626112 Eh      33.97182729 eV
+  5       1.335135653087 Eh      36.33089195 eV
+  6       1.461807513469 Eh      39.77780887 eV
+  7       1.916302247180 Eh      52.14524061 eV
+  8       1.982576083234 Eh      53.94864356 eV
+  9       2.020798815962 Eh      54.98873711 eV
+
+Lanczos basis orthogonality error:
+6.557695028406331e-15
+
+========================================
+PySCF Davidson reference
+========================================
+
+******** <class 'pyscf.adc.radc_ip.RADCIP'> ********
+max_space = 12
+max_cycle = 50
+conv_tol = 1e-08
+max_memory 4000 MB (current use 155 MB)
+
+*************************************************************
+        ADC calculation summary (doublet states only)
+*************************************************************
+adc(2) root 0  |  Energy (Eh) =   0.4033859937  |  Energy (eV) =  10.97669199  |  Spec. factor = 1.81611862  |  conv = True
+adc(2) root 1  |  Energy (Eh) =   0.4909104356  |  Energy (eV) =  13.35835336  |  Spec. factor = 1.82734004  |  conv = True
+adc(2) root 2  |  Energy (Eh) =   0.6570360881  |  Energy (eV) =  17.87886262  |  Spec. factor = 1.85818550  |  conv = True
+adc(2) root 3  |  Energy (Eh) =   1.1589258846  |  Energy (eV) =  31.53597962  |  Spec. factor = 0.50027584  |  conv = True
+adc(2) root 4  |  Energy (Eh) =   1.2043287786  |  Energy (eV) =  32.77145529  |  Spec. factor = 1.27096110  |  conv = True
+adc(2) root 5  |  Energy (Eh) =   1.2425999784  |  Energy (eV) =  33.81286768  |  Spec. factor = 0.00055725  |  conv = True
+adc(2) root 6  |  Energy (Eh) =   1.2452122465  |  Energy (eV) =  33.88395112  |  Spec. factor = 0.00002486  |  conv = True
+adc(2) root 7  |  Energy (Eh) =   1.2508150039  |  Energy (eV) =  34.03640991  |  Spec. factor = 0.01079072  |  conv = True
+adc(2) root 8  |  Energy (Eh) =   1.3159405863  |  Energy (eV) =  35.80856727  |  Spec. factor = 0.00000779  |  conv = True
+adc(2) root 9  |  Energy (Eh) =   1.3159405863  |  Energy (eV) =  35.80856727  |  Spec. factor = 0.00007979  |  conv = True
+
+========================================
+Davidson vs Lanczos
+========================================
+ root        Davidson / Eh         Lanczos / Eh       difference
+    0       0.403385993748       0.449962619363     4.657663e-02
+    1       0.490910435616       0.490907956258    -2.479358e-06
+    2       0.657036088064       0.657026946988    -9.141076e-06
+    3       1.158925884621       1.164836140856     5.910256e-03
+    4       1.204328778586       1.248441626112     4.411285e-02
+    5       1.242599978352       1.335135653087     9.253567e-02
+    6       1.245212246475       1.461807513469     2.165953e-01
+    7       1.250815003936       1.916302247180     6.654872e-01
+    8       1.315940586347       1.982576083234     6.666355e-01
+    9       1.315940586347       2.020798815962     7.048582e-01
+The job finished:  Mon Sep 28 18:18:56 CEST 2026

@@ -1,0 +1,127 @@
+import numpy as np
+from scipy.linalg import eigh
+
+
+def ip_adc_lanczos(adc, niter=50, seed=None, verbose=True):
+    """
+    Symmetric Lanczos calculation for the PySCF RADC IP-ADC matrix.
+
+    Parameters
+    ----------
+    adc
+        A PySCF pyscf.adc.radc_ip.RADCIP object.
+
+    niter
+        Number of Lanczos iterations.
+
+    seed
+        Random seed for the initial vector.
+
+    verbose
+        Print Lanczos information.
+
+    Returns
+    -------
+    alpha
+        Diagonal elements of the Lanczos tridiagonal matrix.
+
+    beta
+        Off-diagonal elements.
+
+    evals
+        Eigenvalues of the Lanczos tridiagonal matrix.
+
+    evecs
+        Eigenvectors of the Lanczos tridiagonal matrix.
+    """
+
+    # Obtain PySCF's ADC matrix-vector operation
+    matvec, diag = adc.gen_matvec()
+
+    dim = len(diag)
+
+    if niter > dim:
+        niter = dim
+
+    # ------------------------------------------------------------
+    # Initial normalized vector
+    # ------------------------------------------------------------
+
+    rng = np.random.default_rng(seed)
+
+    q = rng.normal(size=dim)
+    q /= np.linalg.norm(q)
+
+    q_old = np.zeros_like(q)
+
+    # Lanczos vectors are NOT stored here.
+    # Only q and q_old are needed for the tridiagonal matrix.
+
+    alpha = []
+    beta = []
+
+    beta_old = 0.0
+
+    # ------------------------------------------------------------
+    # Lanczos recursion
+    # ------------------------------------------------------------
+
+    for iteration in range(niter):
+
+        z = matvec(q)
+
+        # alpha_i = <q_i | A | q_i>
+        a = np.dot(q, z)
+        alpha.append(a)
+
+        # Residual
+        z = z - a * q
+
+        if iteration > 0:
+            z -= beta_old * q_old
+
+        # beta_{i+1}
+        b = np.linalg.norm(z)
+
+        if verbose:
+            print(
+                f" Lanczos iteration {iteration + 1:4d} : "
+                f"alpha = {a:16.10f}   beta = {b:16.10f}"
+            )
+
+        if b < 1e-12:
+            break
+
+        beta.append(b)
+
+        q_old = q
+        q = z / b
+        beta_old = b
+
+    alpha = np.asarray(alpha)
+    beta = np.asarray(beta)
+
+    # ------------------------------------------------------------
+    # Construct tridiagonal Lanczos matrix
+    # ------------------------------------------------------------
+
+    T = np.diag(alpha)
+
+    if len(beta) > 0:
+        T += np.diag(beta, 1)
+        T += np.diag(beta, -1)
+
+    # ------------------------------------------------------------
+    # Diagonalize T
+    # ------------------------------------------------------------
+
+    evals, evecs = eigh(T)
+
+    if verbose:
+        print()
+        print("Lanczos eigenvalues:")
+        for i, e in enumerate(evals):
+            print(f" {i+1:4d}  {e:18.10f}")
+
+    return alpha, beta, evals, evecs
+

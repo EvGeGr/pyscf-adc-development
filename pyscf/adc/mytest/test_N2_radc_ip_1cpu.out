@@ -1,0 +1,470 @@
+#INFO: **** input file is /home/evgeniy/prog/pyscf/pyscf/adc/mytest/test_N2_radc_ip.py ****
+#!/usr/bin/env python
+
+'''
+ADC(3) IPs calculation for FAP
+'''
+
+from pyscf import gto, scf, adc
+
+mol = gto.Mole()
+r = 1.098
+mol.atom = [
+     ['N', ( 0., 0.    , -r/2   )],
+     ['N', ( 0., 0.    ,  r/2)],]
+mol.basis = {'N':'cc-pvdz'}
+mol.verbose = 4
+mol.max_memory = 1000
+mol.build()
+
+mf = scf.RHF(mol)
+mf.conv_tol = 1e-12
+mf.kernel()
+mf.analyze()
+
+# Frozen core
+ncore = 2
+mf.mo_coeff = (mf.mo_coeff[:, ncore:])
+mf.mo_energy = (mf.mo_energy[ncore:])
+mf.mol.nelectron -= ncore*2
+
+myadc = adc.RADC(mf).density_fit('cc-pvdz-ri')
+myadc.verbose = 6
+#myadc.compute_properties = False
+myadc.method = "adc(3)"
+myadc.method_type = "ip"
+myadc.conv_tol = 1e-9
+myadc.max_cycle = 100
+myadc.max_memory = 10000
+myadc.incore_complete = True
+#myadc.spin_cont = True
+myadc.kernel(nroots = 5)
+myadc.analyze()
+
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='node06', release='6.8.0-110-generic', version='#110-Ubuntu SMP PREEMPT_DYNAMIC Thu Mar 19 15:09:20 UTC 2026', machine='x86_64')  Threads 1
+Python 3.14.7 | packaged by Anaconda, Inc. | (main, Aug 14 2026, 10:21:40) [GCC 14.3.0]
+numpy 2.5.2  scipy 1.18.1  h5py 3.16.0
+Date: Mon Sep 28 17:04:07 2026
+PySCF version 2.14.0
+PySCF path  /home/evgeniy/prog/pyscf
+GIT ORIG_HEAD 34e5aa023afaf42157932b2b0e35e716f7af0b14
+GIT HEAD (branch master) e47d1279f72ffd50cbad43fbfed50511d8415b7e
+
+[ENV] PYSCF_TMPDIR /scratch/evgeniy/pyscf-test
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 2
+[INPUT] num. electrons = 14
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 0
+[INPUT] symmetry False subgroup None
+[INPUT] Mole.unit = angstrom
+[INPUT] Symbol           X                Y                Z      unit          X                Y                Z       unit  Magmom
+[INPUT]  1 N      0.000000000000   0.000000000000  -0.549000000000 AA    0.000000000000   0.000000000000  -1.037459642386 Bohr   0.0
+[INPUT]  2 N      0.000000000000   0.000000000000   0.549000000000 AA    0.000000000000   0.000000000000   1.037459642386 Bohr   0.0
+
+nuclear repulsion = 23.6153764436066
+number of shells = 10
+number of NR pGTOs = 52
+number of NR cGTOs = 28
+basis = {'N': 'cc-pvdz'}
+ecp = {}
+CPU time:         0.31
+
+
+******** <class 'pyscf.scf.hf.RHF'> ********
+method = RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+diis_damp = 0
+SCF conv_tol = 1e-12
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /scratch/evgeniy/pyscf-test/tmpm8j3416n
+max_memory 1000 MB (current use 128 MB)
+Set gradient conv threshold to 1e-06
+Initial guess from minao.
+init E= -108.991973562118
+  HOMO = -0.381012015229362  LUMO = 0.0698064531805912  gap/eV = 12.26740
+cycle= 1 E= -108.935723851317  delta_E= 0.0562  |g|= 0.275  |ddm|= 1.76
+  HOMO = -0.649650543716879  LUMO = 0.140044799526457  gap/eV = 21.48870
+cycle= 2 E= -108.952988650812  delta_E= -0.0173  |g|= 0.0639  |ddm|= 0.231
+  HOMO = -0.605025787734023  LUMO = 0.177687749891379  gap/eV = 21.29872
+cycle= 3 E= -108.954022356753  delta_E= -0.00103  |g|= 0.0134  |ddm|= 0.051
+  HOMO = -0.608209298118055  LUMO = 0.175282952389672  gap/eV = 21.31991
+cycle= 4 E= -108.954086363525  delta_E= -6.4e-05  |g|= 0.0009  |ddm|= 0.0198
+  HOMO = -0.608023815259198  LUMO = 0.175499553599191  gap/eV = 21.32076
+cycle= 5 E= -108.954086600847  delta_E= -2.37e-07  |g|= 0.000111  |ddm|= 0.00123
+  HOMO = -0.608028523511136  LUMO = 0.175485375467051  gap/eV = 21.32050
+cycle= 6 E= -108.954086605704  delta_E= -4.86e-09  |g|= 1.85e-05  |ddm|= 0.000182
+  HOMO = -0.608023468955295  LUMO = 0.175488353504788  gap/eV = 21.32044
+cycle= 7 E= -108.954086605866  delta_E= -1.62e-10  |g|= 1.66e-06  |ddm|= 6.6e-05
+  HOMO = -0.608023426549354  LUMO = 0.175488161664484  gap/eV = 21.32044
+cycle= 8 E= -108.954086605867  delta_E= -1.08e-12  |g|= 8.65e-08  |ddm|= 5.16e-06
+  HOMO = -0.608023434396748  LUMO = 0.175488153304178  gap/eV = 21.32044
+cycle= 9 E= -108.954086605866  delta_E= 1.14e-13  |g|= 1.04e-08  |ddm|= 2.7e-07
+  HOMO = -0.608023435772518  LUMO = 0.175488150654146  gap/eV = 21.32044
+Extra cycle  E= -108.954086605866  delta_E=    0  |g|= 2.77e-09  |ddm|= 1.12e-08
+converged SCF energy = -108.954086605866
+**** SCF Summaries ****
+Total Energy =                        -108.954086605866479
+Nuclear Repulsion Energy =              23.615376443606557
+One-electron Energy =                 -194.224741971482217
+Two-electron Energy =                   61.655278922009188
+Two-electron Coulomb Energy =           74.764200654593466
+DFT Exchange-Correlation Energy =      -13.108921732584278
+HOMO-LUMO gap [eV] =                    21.320436229398553
+**** MO energy ****
+MO #1   energy= -15.6865343019814  occ= 2
+MO #2   energy= -15.6831378283949  occ= 2
+MO #3   energy= -1.47097226849821  occ= 2
+MO #4   energy= -0.774200964674927 occ= 2
+MO #5   energy= -0.62619983429555  occ= 2
+MO #6   energy= -0.608023435772527 occ= 2
+MO #7   energy= -0.608023435772518 occ= 2
+MO #8   energy= 0.175488150654146  occ= 0
+MO #9   energy= 0.175488150654148  occ= 0
+MO #10  energy= 0.594533657234723  occ= 0
+MO #11  energy= 0.820202900889516  occ= 0
+MO #12  energy= 0.872305019357366  occ= 0
+MO #13  energy= 0.872305019357369  occ= 0
+MO #14  energy= 0.992205670231163  occ= 0
+MO #15  energy= 1.05096884997107   occ= 0
+MO #16  energy= 1.05096884997107   occ= 0
+MO #17  energy= 1.14391828648115   occ= 0
+MO #18  energy= 1.64289877280948   occ= 0
+MO #19  energy= 1.75749568132572   occ= 0
+MO #20  energy= 1.75749568132573   occ= 0
+MO #21  energy= 1.88172825187385   occ= 0
+MO #22  energy= 1.88172825187386   occ= 0
+MO #23  energy= 2.29876738268951   occ= 0
+MO #24  energy= 2.29876738268952   occ= 0
+MO #25  energy= 2.87413281540125   occ= 0
+MO #26  energy= 2.9961165359346    occ= 0
+MO #27  energy= 2.9961165359346    occ= 0
+MO #28  energy= 3.2831228788617    occ= 0
+ ** Mulliken pop on meta-lowdin orthogonal AOs  **
+ ** Mulliken pop  **
+pop of  0 N 1s            1.99999
+pop of  0 N 2s            1.59148
+pop of  0 N 3s            0.01798
+pop of  0 N 2px           0.99380
+pop of  0 N 2py           0.99380
+pop of  0 N 2pz           1.37266
+pop of  0 N 3px           0.00002
+pop of  0 N 3py           0.00002
+pop of  0 N 3pz           0.00864
+pop of  0 N 3dxy          0.00000
+pop of  0 N 3dyz          0.00618
+pop of  0 N 3dz^2         0.00925
+pop of  0 N 3dxz          0.00618
+pop of  0 N 3dx2-y2       0.00000
+pop of  1 N 1s            1.99999
+pop of  1 N 2s            1.59148
+pop of  1 N 3s            0.01798
+pop of  1 N 2px           0.99380
+pop of  1 N 2py           0.99380
+pop of  1 N 2pz           1.37266
+pop of  1 N 3px           0.00002
+pop of  1 N 3py           0.00002
+pop of  1 N 3pz           0.00864
+pop of  1 N 3dxy          0.00000
+pop of  1 N 3dyz          0.00618
+pop of  1 N 3dz^2         0.00925
+pop of  1 N 3dxz          0.00618
+pop of  1 N 3dx2-y2       0.00000
+ ** Mulliken atomic charges  **
+charge of    0N =      0.00000
+charge of    1N =     -0.00000
+Dipole moment(X, Y, Z, Debye): -0.00000, -0.00000, -0.00000
+
+******** <class 'pyscf.adc.radc.RADC'> ********
+max_memory 10000 MB (current use 153 MB)
+******** ADC Orbital Information ********
+Number of Frozen Occupied Orbitals: 0
+Number of Frozen Virtual Orbitals: 0
+Number of Active Occupied Orbitals: 5
+Number of Active Virtual Orbitals: 21
+*****************************************
+******** <class 'pyscf.df.df.DF'> ********
+auxbasis = cc-pvdz-ri
+max_memory = 1000
+    CPU time for DF-ADC integral transformation      0.01 sec, wall time      0.01 sec
+    CPU time for Completed t2_1 amplitude calculation      0.00 sec, wall time      0.00 sec
+    CPU time for Completed t1_2 amplitude calculation      0.00 sec, wall time      0.00 sec
+    CPU time for Completed t2_2 amplitude calculation      0.00 sec, wall time      0.00 sec
+    CPU time for Completed amplitude calculation      0.03 sec, wall time      0.03 sec
+Reference correlation energy (doubles): -0.30221496
+MP3 correlation energy of reference state (a.u.) = -0.30221496
+
+******** <class 'pyscf.adc.radc_ip.RADCIP'> ********
+max_space = 12
+max_cycle = 100
+conv_tol = 1e-09
+max_memory 10000 MB (current use 161 MB)
+    CPU time for Completed M_ij second-order terms ADC(2) calculation      0.00 sec, wall time      0.00 sec
+    CPU time for Starting the small integrals  calculation      0.00 sec
+    CPU time for Completed M_ij ADC(n) calculation      0.01 sec, wall time      0.01 sec
+    CPU time for Completed ea_diag calculation      0.00 sec
+tol 1e-09  toloose 1e-05
+max_cycle 100  max_space 36  max_memory 10000  incore True
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 0 5  |r|= 0.335  e= [0.65103457 0.66312395 0.66312395 0.80216875 1.04808173]  max|de|= 1.05  lindep=    1
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 1 10  |r|= 0.0911  e= [0.55624399 0.60062805 0.60062805 0.68877735 0.95933932]  max|de|= -0.113  lindep= 0.991
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 2 15  |r|= 0.0583  e= [0.55537023 0.60098028 0.60098028 0.68342151 0.95154238]  max|de|= -0.0078  lindep= 0.917
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 3 20  |r|= 0.11  e= [0.55603725 0.60105174 0.60105174 0.68233248 0.92266936]  max|de|= -0.0289  lindep= 0.973
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 4 25  |r|= 0.102  e= [0.55600752 0.60102257 0.60102257 0.68142761 0.8990272 ]  max|de|= -0.0236  lindep= 0.92
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 5 30  |r|= 0.039  e= [0.55600793 0.60102033 0.60102033 0.6814741  0.90426191]  max|de|= 0.00523  lindep= 0.948
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 6 35  |r|= 0.0483  e= [0.55600762 0.60102181 0.60102181 0.68148413 0.90068927]  max|de|= -0.00357  lindep= 0.937
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 7 5  |r|= 0.0483  e= [0.55600762 0.60102181 0.60102181 0.68148413 0.90068927]  max|de|= -1.67e-15  lindep= 0.998
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 8 10  |r|= 0.0367  e= [0.55600851 0.60102171 0.60102171 0.68148405 0.89792733]  max|de|= -0.00276  lindep= 0.727
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 9 15  |r|= 0.0506  e= [0.55600836 0.60102176 0.60102176 0.68148421 0.88381538]  max|de|= -0.0141  lindep= 0.585
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 10 20  |r|= 0.0486  e= [0.55600857 0.60102176 0.60102176 0.68148482 0.88058464]  max|de|= -0.00323  lindep= 0.555
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 11 25  |r|= 0.0228  e= [0.55600854 0.60102175 0.60102175 0.68148467 0.88363505]  max|de|= 0.00305  lindep= 0.897
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+Drop eigenvector 1, norm=2.63e-08
+Drop eigenvector 2, norm=2.63e-08
+davidson 12 30  |r|= 0.00896  e= [0.55600855 0.60102175 0.60102175 0.68148472 0.8839379 ]  max|de|= 0.000303  lindep= 0.879
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+root 1 converged  |r|= 2.63e-08  e= 0.6010217532285649  max|de|= 5.55e-16
+root 2 converged  |r|= 2.63e-08  e= 0.6010217532285723  max|de|= 7.77e-16
+Drop eigenvector 0, norm=1.91e-08
+davidson 13 33  |r|= 0.00787  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88496874]  max|de|= 0.00103  lindep= 0.922
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+root 0 converged  |r|= 1.91e-08  e= 0.5560085536955552  max|de|= -2.78e-15
+root 3 converged  |r|= 2.75e-07  e= 0.681484742956954  max|de|=    0
+davidson 14 5  |r|= 0.00787  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88496874]  max|de|= -2.78e-15  lindep=    1
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 15 6  |r|= 0.00473  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88391404]  max|de|= -0.00105  lindep= 0.945
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 16 7  |r|= 0.00423  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88355705]  max|de|= -0.000357  lindep= 0.958
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 17 8  |r|= 0.00248  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88356284]  max|de|= 5.79e-06  lindep= 0.968
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 18 9  |r|= 0.0014  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88356658]  max|de|= 3.74e-06  lindep= 0.937
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 19 10  |r|= 0.00159  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88402569]  max|de|= 0.000459  lindep= 0.975
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 20 11  |r|= 0.00247  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88399702]  max|de|= -2.87e-05  lindep= 0.922
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 21 12  |r|= 0.00194  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88374421]  max|de|= -0.000253  lindep= 0.989
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 22 13  |r|= 0.00083  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88379873]  max|de|= 5.45e-05  lindep= 0.911
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 23 14  |r|= 0.00082  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88366845]  max|de|= -0.00013  lindep= 0.916
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 24 15  |r|= 0.00106  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88372907]  max|de|= 6.06e-05  lindep= 0.957
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 25 16  |r|= 0.000355  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.8837243 ]  max|de|= -4.77e-06  lindep= 0.97
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 26 17  |r|= 0.000112  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88373775]  max|de|= 1.34e-05  lindep= 0.942
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 27 18  |r|= 3.13e-05  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88374338]  max|de|= 5.63e-06  lindep= 0.967
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 28 19  |r|= 4.65e-06  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88374311]  max|de|= -2.7e-07  lindep= 0.965
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 29 20  |r|= 1.48e-06  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88374317]  max|de|= 5.93e-08  lindep= 0.953
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 30 21  |r|= 1.06e-06  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88374307]  max|de|= -9.72e-08  lindep= 0.912
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 31 22  |r|= 9.01e-07  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88374308]  max|de|= 4e-09  lindep= 0.969
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+davidson 32 23  |r|= 2.75e-07  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88374308]  max|de|= 6.45e-09  lindep= 0.965
+    CPU time for completed sigma vector calculation      0.00 sec, wall time      0.00 sec
+Drop eigenvector 4, norm=6e-08
+davidson 33 24  |r|= 2.75e-07  e= [0.55600855 0.60102175 0.60102175 0.68148474 0.88374309]  max|de|= 2.87e-09  lindep=    1
+Linear dependency in trial subspace. |r| for each state [1.91114782e-08 2.63182579e-08 2.63182605e-08 2.74521660e-07
+ 5.99941820e-08]
+
+*************************************************************
+        ADC calculation summary (doublet states only)
+*************************************************************
+adc(3) root 0  |  Energy (Eh) =   0.5560085537  |  Energy (eV) =  15.12976339  |  Spec. factor = 1.83239149  |  conv = True
+adc(3) root 1  |  Energy (Eh) =   0.6010217532  |  Energy (eV) =  16.35463493  |  Spec. factor = 1.86375475  |  conv = True
+adc(3) root 2  |  Energy (Eh) =   0.6010217532  |  Energy (eV) =  16.35463493  |  Spec. factor = 1.86375475  |  conv = True
+adc(3) root 3  |  Energy (Eh) =   0.6814847430  |  Energy (eV) =  18.54414441  |  Spec. factor = 1.65959350  |  conv = True
+adc(3) root 4  |  Energy (Eh) =   0.8837430862  |  Energy (eV) =  24.04787426  |  Spec. factor = 0.00335058  |  conv = True
+    CPU time for ADC      0.45 sec, wall time      0.45 sec
+
+*************************************************************
+           Eigenvector analysis summary
+*************************************************************
+Number of occupied orbitals = 5
+Number of virtual orbitals =  21
+Print eigenvector elements > 0.100000
+
+adc(3) | root 0 | Energy (eV) =  15.12976339 | norm(1h)  = 0.9299 | norm(2h1p) = 0.0701 
+
+1h block: 
+     i     U(i)
+------------------
+     3    0.9641
+***************************************************************************************
+
+adc(3) | root 1 | Energy (eV) =  16.35463493 | norm(1h)  = 0.9608 | norm(2h1p) = 0.0392 
+
+1h block: 
+     i     U(i)
+------------------
+     5   -0.9799
+***************************************************************************************
+
+adc(3) | root 2 | Energy (eV) =  16.35463493 | norm(1h)  = 0.9608 | norm(2h1p) = 0.0392 
+
+1h block: 
+     i     U(i)
+------------------
+     4    0.9785
+***************************************************************************************
+
+adc(3) | root 3 | Energy (eV) =  18.54414441 | norm(1h)  = 0.8431 | norm(2h1p) = 0.1569 
+
+1h block: 
+     i     U(i)
+------------------
+     2   -0.9182
+
+2h1p block: 
+     i     j     a     U(i,j,a)
+-------------------------------
+     5     3     7      0.1532
+     4     3     6     -0.1532
+     3     5     7      0.1396
+     3     4     6     -0.1396
+***************************************************************************************
+
+adc(3) | root 4 | Energy (eV) =  24.04787426 | norm(1h)  = 0.0000 | norm(2h1p) = 1.0000 
+
+2h1p block: 
+     i     j     a     U(i,j,a)
+-------------------------------
+     5     4     6     -0.4518
+     5     5     7      0.3923
+     5     4     7     -0.2781
+     5     5     6     -0.2771
+     4     4     6      0.2707
+     4     5     7     -0.2698
+     5     4    14      0.1355
+     5     5    13      0.1255
+***************************************************************************************
+
+
+*************************************************************
+            Spectroscopic factors analysis summary
+*************************************************************
+Print spectroscopic factors > 1.000000E-01
+
+adc(3) | root 0 | Energy (eV) =  15.12976339 
+
+     HF MO     Spec. Contribution     Orbital symmetry
+-----------------------------------------------------------
+       3          1.83055595                A
+
+Partial spec. factor sum = 1.83055595
+***********************************************************
+
+adc(3) | root 1 | Energy (eV) =  16.35463493 
+
+     HF MO     Spec. Contribution     Orbital symmetry
+-----------------------------------------------------------
+       5          1.86247934                A
+
+Partial spec. factor sum = 1.86247934
+***********************************************************
+
+adc(3) | root 2 | Energy (eV) =  16.35463493 
+
+     HF MO     Spec. Contribution     Orbital symmetry
+-----------------------------------------------------------
+       4          1.85702900                A
+
+Partial spec. factor sum = 1.85702900
+***********************************************************
+
+adc(3) | root 3 | Energy (eV) =  18.54414441 
+
+     HF MO     Spec. Contribution     Orbital symmetry
+-----------------------------------------------------------
+       2          1.65841008                A
+
+Partial spec. factor sum = 1.65841008
+***********************************************************
+
